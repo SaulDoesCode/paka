@@ -45,7 +45,7 @@ async fn generate_token(count: web::Path<usize>, body: web::Bytes) -> HttpRespon
         // generate a random token and save it to ./dist/{token}
         let tkn = random_string(24);
         let token = Token {
-            exp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600,
+            exp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1),
             bin: None,
         };
         let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, tkn).parse().unwrap();
@@ -64,6 +64,38 @@ async fn generate_token(count: web::Path<usize>, body: web::Bytes) -> HttpRespon
     }
 
     HttpResponse::Ok().json(tokens)
+}
+
+#[post("/expire-tokens")]
+async fn expire_tokens(pwd: web::Bytes) -> HttpResponse {
+    let admin_password = ADMIN_PASSWORD.lock().unwrap();
+    // validate admin password from bytes
+    if pwd != admin_password.as_bytes() {
+        return HttpResponse::Unauthorized().finish();
+    }
+
+    let mut expired_tokens = Vec::new();
+    if let Ok(entries) = fs::read_dir(TOKENS_DIR) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Ok(metadata) = fs::metadata(&path) {
+                    if metadata.is_file() {
+                        let token = decrypt::<Token>(&fs::read(&path).unwrap());
+                        if let Some(token) = token {
+                            if token.exp < std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
+                                if fs::remove_file(&path).is_ok() {
+                                    expired_tokens.push(path.file_name().unwrap().to_str().unwrap().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(expired_tokens)
 }
 
 fn encrypt<T: Serialize>(payload: T) -> Option<Vec<u8>> {
@@ -376,6 +408,7 @@ async fn main() -> io::Result<()> {
         App::new()
             .service(generate_token)
             .service(change_password)
+            .service(expire_tokens)
             .service(remove_gz_files)
             .service(get_file_info)
             .service(upload_file)
