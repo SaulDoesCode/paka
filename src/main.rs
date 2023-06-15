@@ -1,17 +1,19 @@
 use mimalloc::MiMalloc;
+use tokio::io::AsyncWriteExt;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 use std::{io::{self, Read, Write}, fs, path::{Path, PathBuf}, sync::Mutex};
 use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding, self}};
 use actix_files::NamedFile;
-use base64::{Engine as _, engine::general_purpose};
+use base64::{Engine as _};
 use cocoon::{Cocoon};
 use flate2::{Compression, write::GzEncoder};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::NamedTempFile;
+
 
 const ADMIN_PWD_FILE_PATH: &str = "./admin_pwd.txt";
 const TOKENS_DIR: &str = "./tokens";
@@ -33,6 +35,10 @@ lazy_static::lazy_static! {
         let key = get_admin_password().expect("could not get admin password for the hasher").as_bytes().to_vec();
         sthash::Hasher::new(sthash::Key::from_seed(key.as_slice(), None), None)
     };
+    static ref B64: base64::engine::GeneralPurpose = {
+        let abc = base64::alphabet::Alphabet::new("+_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").expect("aplhabet was too much for base64, sorry");
+        base64::engine::GeneralPurpose::new(&abc, base64::engine::general_purpose::GeneralPurposeConfig::new().with_encode_padding(false).with_decode_allow_trailing_bits(true))
+    };
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +55,7 @@ async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpRespons
     }
     let count = count.into_inner();
     let mut tokens = Vec::new();
+    let mut ticker = 0;
     while tokens.len() < count {
         // generate a random token and save it to ./dist/{token}
         let tkn = random_string(24);
@@ -57,24 +64,32 @@ async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpRespons
             bin: None,
         };
         let hash = HASHER.hash(tkn.as_bytes());
-        let encoded_hash = general_purpose::STANDARD_NO_PAD.encode(&hash);
+        let encoded_hash = B64.encode(&hash);
         let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
-        if let Ok(f) = fs::File::create(&token_path) {
-            let bin = encrypt(&token).expect("could not encrypt token");
-            let mut token_file = io::BufWriter::new(f);
-            if token_file.write_all(&bin).is_ok() && token_file.flush().is_ok() {
-                // println!("Generated tkn {}", tkn);
-                tokens.push(tkn);
-            } else {
-                println!("Failed to write token to file");
-                if fs::remove_file(&token_path).is_ok() {
-                    println!("Removed failed token file");
+        match tokio::fs::File::create(&token_path).await {
+            Ok(mut f) => {
+                let bin = encrypt(&token).expect("could not encrypt token");
+                match f.write_all(&bin).await {
+                    Ok(_) => {
+                        // println!("Generated tkn {}", tkn);
+                        tokens.push(tkn);
+                    },
+                    Err(e) => {
+                        println!("Failed to write token to file: {}", e);
+                        if fs::remove_file(&token_path).is_ok() {
+                            println!("Removed failed token file");
+                        }
+                    }
                 }
+            },
+            Err(e) => {
+                println!("Failed to create token file at path {:?} : {}", token_path, e);
+                return HttpResponse::InternalServerError().finish();
             }
-        } else {
-            println!("Failed to create token file");
-            return HttpResponse::InternalServerError().finish();
         }
+
+        ticker += 1;
+        println!("Generate {} token attempts", ticker);
     }
     HttpResponse::Ok().json(tokens)
 }
@@ -346,7 +361,7 @@ fn get_query_param_value(query_string: &str, key: &str) -> Option<String> {
 
 fn authenticate_token(req: &HttpRequest) -> bool {
     let token = match get_query_param_value(&req.query_string(), "tk") {
-        Some(tkn) => general_purpose::STANDARD_NO_PAD.encode(&HASHER.hash(tkn.as_bytes())),
+        Some(tkn) => B64.encode(&HASHER.hash(tkn.as_bytes())),
         _ => return false,
     };
     
