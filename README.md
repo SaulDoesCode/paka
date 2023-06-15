@@ -173,3 +173,7 @@ That's it! You have successfully built and run the Paka server. Feel free to exp
 * websocket interface
 * pub/sub
 * quality errors and error handling
+
+## HELP OUT
+
+[ko-fi.com/saulvdw]()
