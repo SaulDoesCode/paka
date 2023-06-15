@@ -37,6 +37,8 @@ The server exposes the following API endpoints:
 - `GET /static/{filename}`: Serves static files such as HTML, CSS, JavaScript, and images.
 - `GET /`: Serves the main index.html file.
 
+[paka-works.png](https://postimg.cc/kBQ4gTYP)
+
 ## Token Generation
 
 The server provides a token generation functionality that allows the creation of tokens for authentication and file access. Tokens are generated using a POST request to the `/make-tokens/{count}` endpoint. The provided admin password is validated, and if correct, the specified number of tokens is generated and saved as files on the server. Tokens are valid for one hour only, and they are use once. 
