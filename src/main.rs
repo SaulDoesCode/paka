@@ -1,6 +1,11 @@
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::{io::{self, Read, Write}, fs, path::{Path, PathBuf}, sync::Mutex};
 use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding, self}};
 use actix_files::NamedFile;
+use base64::{Engine as _, engine::general_purpose};
 use cocoon::{Cocoon};
 use flate2::{Compression, write::GzEncoder};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -10,6 +15,7 @@ use tempfile::NamedTempFile;
 
 const ADMIN_PWD_FILE_PATH: &str = "./admin_pwd.txt";
 const TOKENS_DIR: &str = "./tokens";
+const STATIC_FILES_DIR: &str = "./static/";
 const GZIPABLE_TYPES: [&str; 8] = [
     "text/html",
     "text/css",
@@ -23,6 +29,10 @@ const GZIPABLE_TYPES: [&str; 8] = [
 
 lazy_static::lazy_static! {
     static ref ADMIN_PASSWORD: Mutex<String> = Mutex::new(get_admin_password().unwrap_or_else(|| generate_admin_password()));
+    static ref HASHER: sthash::Hasher = {
+        let key = get_admin_password().expect("could not get admin password for the hasher").as_bytes().to_vec();
+        sthash::Hasher::new(sthash::Key::from_seed(key.as_slice(), None), None)
+    };
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,27 +42,28 @@ struct Token {
 }
 
 #[post("/make-tokens/{count}")]
-async fn generate_token(count: web::Path<usize>, body: web::Bytes) -> HttpResponse {
-    let admin_password = ADMIN_PASSWORD.lock().unwrap();
-    // validate admin password from bytes
-    let pwd = String::from_utf8(body.to_vec()).unwrap();
-    if pwd.trim() != *admin_password {
+async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpResponse {
+    let admin_password = get_admin_password().expect("could not get admin password for token generation");
+    if pwd != admin_password.as_bytes() {
         return HttpResponse::Unauthorized().finish();
     }
-
+    let count = count.into_inner();
     let mut tokens = Vec::new();
-    for _ in 0..count.into_inner() {
+    while tokens.len() < count {
         // generate a random token and save it to ./dist/{token}
         let tkn = random_string(24);
         let token = Token {
             exp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1),
             bin: None,
         };
-        let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, tkn).parse().unwrap();
+        let hash = HASHER.hash(tkn.as_bytes());
+        let encoded_hash = general_purpose::STANDARD_NO_PAD.encode(&hash);
+        let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
         if let Ok(f) = fs::File::create(&token_path) {
-            let bin = encrypt(&token).unwrap();
+            let bin = encrypt(&token).expect("could not encrypt token");
             let mut token_file = io::BufWriter::new(f);
             if token_file.write_all(&bin).is_ok() && token_file.flush().is_ok() {
+                // println!("Generated tkn {}", tkn);
                 tokens.push(tkn);
             } else {
                 println!("Failed to write token to file");
@@ -60,9 +71,11 @@ async fn generate_token(count: web::Path<usize>, body: web::Bytes) -> HttpRespon
                     println!("Removed failed token file");
                 }
             }
+        } else {
+            println!("Failed to create token file");
+            return HttpResponse::InternalServerError().finish();
         }
     }
-
     HttpResponse::Ok().json(tokens)
 }
 
@@ -199,12 +212,12 @@ async fn serve_static_files(req: HttpRequest, filename: web::Path<String>) -> Ht
         }
     }
 
-    let file_path = format!("./static/{}", filename);
+    let file_path = format!("{}{}", STATIC_FILES_DIR, filename);
     if let Ok(file) = NamedFile::open(&file_path) {
         return file.into_response(&req);
     }
 
-    NamedFile::open("./static/404.html").unwrap().into_response(&req)
+    NamedFile::open(format!("{}404.html", STATIC_FILES_DIR)).expect("404 itself was lost").into_response(&req)
 }
 
 #[post("/remove-gz-files")]
@@ -236,7 +249,7 @@ async fn remove_gz_files(pwd: web::Bytes) -> HttpResponse {
 }
 
 fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpResponse {
-    let file_path = format!("./static/{}", filename);
+    let file_path = format!("{}{}", STATIC_FILES_DIR, filename);
     let gzipped_file_path = format!("{}.gz", &file_path);
     let ct = mime_guess::from_path(&file_path).first_or_octet_stream();
     if let Ok(file) = NamedFile::open(&gzipped_file_path) {
@@ -272,7 +285,7 @@ fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpRespon
         }
     }
     // serve_gzipped_static_files(req, "./static/404.html".to_string())
-    let mut res = NamedFile::open("./static/404.html.gz")
+    let mut res = NamedFile::open(format!("{}404.html.gz", STATIC_FILES_DIR))
         .expect("404 gzipped not even found")
         .set_content_encoding(ContentEncoding::Gzip)
         .into_response(&req);
@@ -314,7 +327,7 @@ fn compress_content(file: &NamedFile) -> Option<Vec<u8>> {
 #[get("/")]
 async fn serve_index() -> HttpResponse {
     // read and serve ./static/index.html
-    match fs::read("./static/index.html") {
+    match fs::read(format!("{}index.html", STATIC_FILES_DIR)) {
         Ok(data) => HttpResponse::Ok().content_type("text/html").body(data),
         Err(_) => HttpResponse::NotFound().finish(),
     }
@@ -333,7 +346,7 @@ fn get_query_param_value(query_string: &str, key: &str) -> Option<String> {
 
 fn authenticate_token(req: &HttpRequest) -> bool {
     let token = match get_query_param_value(&req.query_string(), "tk") {
-        Some(tkn) if tkn.len() == 24 => tkn,
+        Some(tkn) => general_purpose::STANDARD_NO_PAD.encode(&HASHER.hash(tkn.as_bytes())),
         _ => return false,
     };
     
@@ -370,7 +383,7 @@ fn generate_admin_password() -> String {
 }
 
 fn generate_random_password() -> String {
-    random_string(24)
+    random_string(32)
 }
 
 fn get_admin_password() -> Option<String> {

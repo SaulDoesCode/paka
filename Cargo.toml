@@ -24,10 +24,25 @@ cocoon = "^0.3"
 sha2 = "*"
 flate2 = "*"
 mime_guess = "*"
+sthash = { git = "https://github.com/jedisct1/rust-sthash" }
+mimalloc = {version = "*", default-features = false, features = ["secure", "local_dynamic_tls"]}
 
+[profile.dev]
+codegen-units = 16
+debug = true
+lto = "off"
+opt-level = 0
 
 [profile.dev.package.cocoon]
 opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+[profile.release]
+codegen-units = 1
+debug = false
+debug-assertions = false
+lto = "fat"
+opt-level = 3
+panic = 'abort'
