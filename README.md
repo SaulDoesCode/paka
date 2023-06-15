@@ -94,3 +94,73 @@ The token-making route is responsible for generating tokens based on the specifi
 8. The route returns a success response indicating the number of tokens generated.
 
 The inclusion of the expiry check and the calculation involving Unix time is important for ensuring the security and validity of the generated tokens. By setting an expiration time, the tokens become valid only for a specific duration, reducing the risk of unauthorized access if a token is compromised.
+
+## Building and Running the Paka Server
+
+The Paka server is a Rust-based server that provides various functionalities such as token generation, file upload, and download. Follow the instructions below to build and run the Paka server.
+
+### Prerequisites
+
+Before building and running the Paka server, ensure that you have the following dependencies installed:
+
+- Rust (stable version)
+- Cargo (Rust's package manager)
+
+### Step 1: Clone the Repository
+
+1. Open your terminal or command prompt.
+2. Change the current directory to the location where you want to clone the repository.
+3. Run the following command to clone the repository:
+
+   ```bash
+   git clone <repository_url>
+   ```
+
+### Step 2: Navigate to the Project Directory
+
+1. Change the current directory to the cloned repository's directory:
+
+   ```bash
+   cd <repository_directory>
+   ```
+
+### Step 3: Build the Paka Server
+
+1. Run the following command to build the Paka server:
+
+   ```bash
+   cargo build --release
+   ```
+
+   This command compiles the server code and its dependencies, creating an optimized release build.
+
+### Step 4: Run the Paka Server
+
+1. After successful build, run the following command to start the Paka server:
+
+   ```bash
+   cargo run --release
+   ```
+
+   This command starts the server and binds it to the default address `0.0.0.0:9797`.
+
+   **Note:** If you want to bind the server to a specific address, modify the `bind` argument in the `HttpServer::bind` function call in the `main` function of the `main.rs` file before building the server.
+2. The Paka server is now running and ready to accept incoming requests.
+
+### Step 5: Interacting with the Paka Server
+
+1. Use an API testing tool (e.g., cURL, Postman) or a web browser to send HTTP requests to the Paka server.
+
+   - To generate tokens, send a POST request to `http://localhost:9797/make-tokens/{count}`, where `{count}` is the desired number of tokens to generate.
+   - To upload a file, send a POST request to `http://localhost:9797/file/{filename}` with the file contents in the request body.
+   - To download a file, send a GET request to `http://localhost:9797/file/{filename}`.
+   - For other available routes, refer to the server code or the provided documentation.
+2. The server will respond to the requests based on the implemented functionality and authentication mechanisms.
+
+### Additional Notes
+
+- The Paka server stores tokens and files in the specified directories (`TOKENS_DIR` and `./dist/`, respectively) relative to the server's execution location.
+- You can customize various server configurations, such as the admin password file path and the types of files that should be compressed, by modifying the respective constants in the server's code.
+- It is recommended to consult the server's code and comments for more detailed information about its functionality and configuration.
+
+That's it! You have successfully built and run the Paka server. Feel free to explore its various endpoints and functionalities as needed.
