@@ -41,7 +41,11 @@ The server exposes the following API endpoints:
 
 ## Token Generation
 
-The server provides a token generation functionality that allows the creation of tokens for authentication and file access. Tokens are generated using a POST request to the `/make-tokens/{count}` endpoint. The provided admin password is validated, and if correct, the specified number of tokens is generated and saved as files on the server. Tokens are valid for one hour only, and they are use once. 
+The server provides a token generation functionality that allows the creation of tokens for authentication and file access. Tokens are generated using a POST request to the `/make-tokens/{count}` endpoint. The provided admin password is validated, and if correct, the specified number of tokens is generated and saved as files on the server. Tokens are valid for a day (timestamp code you can change it, will eventually make things configurable by less baked in means), and they are use once, the tokens that is.
+
+tokens are hashed with sthash and the actual token you use it not saved on the server only its hash and meta-data, making it so that you can't read the token filenames and get free tokens.
+
+TODO: figure out how to safely hide the admin_pwd so that it doesn't need to be a text file, perhaps should require password be given from an http event or something so that the data is essentially encrypted fully at rest. one pwd to rule them all. still thinking about it. 
 
 ## File Management
 
@@ -167,7 +171,6 @@ Before building and running the Paka server, ensure that you have the following 
 
 That's it! You have successfully built and run the Paka server. Feel free to explore its various endpoints and functionalities as needed.
 
-
 ## FUTURE features and enbetterments
 
 * tls
@@ -175,7 +178,6 @@ That's it! You have successfully built and run the Paka server. Feel free to exp
 * websocket interface
 * pub/sub
 * quality errors and error handling
-
 
 ## HELP OUT
 
