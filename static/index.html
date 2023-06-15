@@ -7,10 +7,34 @@
 </head>
 <body>
     <h1>Paka</h1>
+    <input type="password">
     <script type="module">
         import paka from "./static/paka.mjs"
+        console.log(paka, Object.getOwnPropertyDescriptors(paka));
+        (async () => {
+            const p = await new Promise(async (resolve, reject) => {
+                document.querySelector('input[type="password"]').addEventListener('keydown', async e => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault()
+                        localStorage.setItem('tokens', JSON.stringify(await paka.makeTokens(e.target.value, 3)))
+                        await fetch('/remove-gz-files', {method: 'POST', body: e.target.value})
+                        const p = paka.fromTokens(...JSON.parse(localStorage.getItem('tokens')))()
+                        p.ifTaking(_ => {
+                            localStorage.setItem('tokens', JSON.stringify(p.tokens))
+                        })
+                        resolve(p)
+                    }
+                })
+            })
 
-        console.log(paka())
+            console.log(p)
+
+            console.log('trying to write file: test - ', await p.post('test', 'test'))
+            console.log('trying to read file: test - ', await p.get('test'))
+            console.log('trying to delete file: test - ', await p.delete('test'))
+            
+            console.log('success, 3 tokens spent');
+        })()
     </script>
 </body>
 </html>
