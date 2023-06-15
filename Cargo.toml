@@ -8,7 +8,7 @@ authors = ["Saul van der Walt", "ChatGPT"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = "*"
+actix-web ={ version = "*", features = ["rustls"]}
 actix-files = "*"
 base64 = "*"
 futures = "*"
@@ -26,6 +26,8 @@ flate2 = "*"
 mime_guess = "*"
 sthash = { git = "https://github.com/jedisct1/rust-sthash" }
 mimalloc = {version = "*", default-features = false, features = ["secure", "local_dynamic_tls"]}
+rustls = "0.20.8"
+rustls-pemfile = "*"
 
 [profile.dev]
 codegen-units = 16

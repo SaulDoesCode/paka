@@ -3,13 +3,15 @@ use tokio::io::AsyncWriteExt;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{io::{self, Read, Write}, fs, path::{Path, PathBuf}, sync::Mutex};
+use std::{io::{self, Read, Write, BufReader}, fs, path::{Path, PathBuf}, sync::Mutex};
 use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding, self}};
 use actix_files::NamedFile;
 use base64::{Engine as _};
 use cocoon::{Cocoon};
 use flate2::{Compression, write::GzEncoder};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -18,6 +20,8 @@ use tempfile::NamedTempFile;
 const ADMIN_PWD_FILE_PATH: &str = "./admin_pwd.txt";
 const TOKENS_DIR: &str = "./tokens";
 const STATIC_FILES_DIR: &str = "./static/";
+const CERT_PEM: &str = "./secrets/cert.pem";
+const PRIV_PEM: &str = "./secrets/priv.pem";
 const GZIPABLE_TYPES: [&str; 8] = [
     "text/html",
     "text/css",
@@ -428,6 +432,9 @@ async fn main() -> io::Result<()> {
         set_admin_password(&password).unwrap();
         password
     });
+
+    let tls_config = load_rustls_config();
+
     HttpServer::new(|| {
         App::new()
             .service(generate_token)
@@ -441,7 +448,37 @@ async fn main() -> io::Result<()> {
             .service(serve_index)
             .service(serve_static_files)
     })
-    .bind("0.0.0.0:9797")?
-    .run()
-    .await
+    .bind_rustls(("0.0.0.0", 9797), tls_config)?
+    .run().await
+}
+
+fn load_rustls_config() -> rustls::ServerConfig {
+    // init server config builder with safe defaults
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth();
+
+    // load TLS key/cert files
+    let cert_file = &mut BufReader::new(fs::File::open(CERT_PEM).expect("Could not open cert file."));
+    let key_file = &mut BufReader::new(fs::File::open(PRIV_PEM).expect("Could not open key file."));
+
+    // convert files to key/cert objects
+    let cert_chain = certs(cert_file)
+        .unwrap()
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    let mut keys: Vec<PrivateKey> = pkcs8_private_keys(key_file)
+        .unwrap()
+        .into_iter()
+        .map(PrivateKey)
+        .collect();
+
+    // exit if no keys could be parsed
+    if keys.is_empty() {
+        eprintln!("Could not locate PKCS 8 private keys.");
+        std::process::exit(1);
+    }
+
+    config.with_single_cert(cert_chain, keys.remove(0)).unwrap()
 }
