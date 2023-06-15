@@ -175,6 +175,34 @@ async fn serve_static_files(req: HttpRequest, filename: web::Path<String>) -> Ht
     NamedFile::open("./static/404.html").unwrap().into_response(&req)
 }
 
+#[post("/remove-gz-files")]
+async fn remove_gz_files(pwd: web::Bytes) -> HttpResponse {
+    if let Some(ap) = get_admin_password() {
+        if ap.as_bytes() != pwd {
+            return HttpResponse::Unauthorized().finish();
+        }
+    } else {
+        return HttpResponse::Unauthorized().finish();
+    }
+    // look in the ./static directory and remove all the files that end with .gz
+    let static_dir = Path::new("./static");
+    if let Ok(entries) = fs::read_dir(static_dir) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "gz" {
+                        if let Err(e) = fs::remove_file(path) {
+                            println!("Failed to remove file: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    HttpResponse::Ok().finish()
+}
+
 fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpResponse {
     let file_path = format!("./static/{}", filename);
     let gzipped_file_path = format!("{}.gz", &file_path);
@@ -348,6 +376,7 @@ async fn main() -> io::Result<()> {
         App::new()
             .service(generate_token)
             .service(change_password)
+            .service(remove_gz_files)
             .service(get_file_info)
             .service(upload_file)
             .service(delete_file)
