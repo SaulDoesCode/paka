@@ -55,7 +55,6 @@ async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpRespons
     }
     let count = count.into_inner();
     let mut tokens = Vec::new();
-    let mut ticker = 0;
     while tokens.len() < count {
         // generate a random token and save it to ./dist/{token}
         let tkn = random_string(24);
@@ -87,9 +86,6 @@ async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpRespons
                 return HttpResponse::InternalServerError().finish();
             }
         }
-
-        ticker += 1;
-        println!("Generate {} token attempts", ticker);
     }
     HttpResponse::Ok().json(tokens)
 }
