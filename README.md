@@ -30,7 +30,7 @@ The server exposes the following API endpoints:
 
 - `POST /make-tokens/{count}`: Generates a specified number of tokens for authentication purposes.
 - `POST /admin/change-password`: Changes the admin password.
-- `GET /file-info/{filename}`: Retrieves information about a file.
+- `GET /file-info/{filename}?tk=TOKENSTRING`: Retrieves information about a file.
 - `POST /file/{filename}?tk=TOKENSTRING`: Uploads a file to the server.
 - `GET /file/{filename}?tk=TOKENSTRING`: Downloads a file from the server.
 - `DELETE /file/{filename}?tk=TOKENSTRING`: Deletes a file from the server.
