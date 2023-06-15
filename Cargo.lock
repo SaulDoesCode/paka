@@ -1033,6 +1033,7 @@ dependencies = [
  "flate2",
  "futures",
  "lazy_static",
+ "mime_guess",
  "rand",
  "serde",
  "serde_json",

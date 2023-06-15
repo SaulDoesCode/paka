@@ -20,9 +20,10 @@ rand = "*"
 tempfile = "*"
 bincode = "*"
 lazy_static = "*"
-cocoon = "0.3.2"
+cocoon = "^0.3"
 sha2 = "*"
 flate2 = "*"
+mime_guess = "*"
 
 
 [profile.dev.package.cocoon]

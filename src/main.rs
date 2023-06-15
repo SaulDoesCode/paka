@@ -1,5 +1,5 @@
 use std::{io::{self, Read, Write}, fs, path::{Path, PathBuf}, sync::Mutex};
-use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding}};
+use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding, self}};
 use actix_files::NamedFile;
 use cocoon::{Cocoon};
 use flate2::{Compression, write::GzEncoder};
@@ -158,26 +158,78 @@ async fn delete_file(req: HttpRequest, filename: web::Path<String>) -> HttpRespo
 }
 
 #[get("/static/{filename}")]
-async fn serve_static_files(filename: web::Path<String>) -> NamedFile {
-    let file_path = format!("./static/{}", filename);
-
-    let gzipped_file_path = format!("{}.gz", &file_path);
-    if let Ok(file) = NamedFile::open(&gzipped_file_path) {
-        return file.set_content_encoding(ContentEncoding::Gzip);
-    }
-
-    if let Ok(file) = NamedFile::open(&file_path) {
-        if should_compress(&file) {
-            if let Some(compressed_content) = compress_content(&file) {
-                if let Err(err) = fs::write(&gzipped_file_path, compressed_content) {
-                    eprintln!("Failed to write compressed file: {}", err);
-                }
+async fn serve_static_files(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
+    if let Some(ae) = req.headers().get(header::ACCEPT_ENCODING) {
+        if let Ok(accept_encoding) = ae.to_str() {
+            if accept_encoding.contains("gzip") {
+                return serve_gzipped_static_files(&req, filename.to_string());
             }
-            return file.set_content_encoding(ContentEncoding::Gzip);
         }
     }
 
-    NamedFile::open("./static/404.html").unwrap()
+    let file_path = format!("./static/{}", filename);
+    if let Ok(file) = NamedFile::open(&file_path) {
+        return file.into_response(&req);
+    }
+
+    NamedFile::open("./static/404.html").unwrap().into_response(&req)
+}
+
+fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpResponse {
+    let file_path = format!("./static/{}", filename);
+    let gzipped_file_path = format!("{}.gz", &file_path);
+    let ct = mime_guess::from_path(&file_path).first_or_octet_stream();
+    if let Ok(file) = NamedFile::open(&gzipped_file_path) {
+        let mut res = file.set_content_encoding(ContentEncoding::Gzip).into_response(req);
+        res.headers_mut().insert(
+            header::VARY,
+            header::HeaderValue::from_static("Accept-Encoding")
+        );
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_str(&ct.to_string()).unwrap()
+        );
+        if filename.starts_with("404") {
+            res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
+        }
+        res.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static("inline")
+        );
+        return res;
+    } else if Path::new(&file_path).exists() {
+        if let Ok(file) = NamedFile::open(&file_path) {
+            if should_compress(&file) {
+                if let Some(compressed_content) = compress_content(&file) {
+                    if let Err(err) = fs::write(&gzipped_file_path, compressed_content) {
+                        eprintln!("Failed to write compressed file: {}", err);
+                    } else {
+                        return serve_gzipped_static_files(req, filename);
+                    }
+                }
+            }
+            return file.into_response(req);
+        }
+    }
+    // serve_gzipped_static_files(req, "./static/404.html".to_string())
+    let mut res = NamedFile::open("./static/404.html.gz")
+        .expect("404 gzipped not even found")
+        .set_content_encoding(ContentEncoding::Gzip)
+        .into_response(&req);
+    res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
+    res.headers_mut().insert(
+        header::VARY,
+        header::HeaderValue::from_static("Accept-Encoding")
+    );
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/html")
+    );
+    res.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static("inline")
+    );
+    res
 }
 
 fn should_compress(file: &NamedFile) -> bool {
