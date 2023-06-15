@@ -65,8 +65,9 @@ The server initializes
 
  with an admin password, which can be changed using the `/admin/change-password` endpoint. The admin password is stored in the `ADMIN_PWD_FILE_PATH` file.
 
-This documentation provides an overview of the Rust server's structure and functionality. For more detailed information, refer to the comments in the code itself.
+This documentation provides an overview of the Paka server's structure and functionality. For more detailed information, refer to the comments in the code itself.
 
+PORT is 9797
 
 ### Authentication Token Function
 
