@@ -31,9 +31,9 @@ The server exposes the following API endpoints:
 - `POST /make-tokens/{count}`: Generates a specified number of tokens for authentication purposes.
 - `POST /admin/change-password`: Changes the admin password.
 - `GET /file-info/{filename}`: Retrieves information about a file.
-- `POST /file/{filename}`: Uploads a file to the server.
-- `GET /file/{filename}`: Downloads a file from the server.
-- `DELETE /file/{filename}`: Deletes a file from the server.
+- `POST /file/{filename}?tk=TOKENSTRING`: Uploads a file to the server.
+- `GET /file/{filename}?tk=TOKENSTRING`: Downloads a file from the server.
+- `DELETE /file/{filename}?tk=TOKENSTRING`: Deletes a file from the server.
 - `GET /static/{filename}`: Serves static files such as HTML, CSS, JavaScript, and images.
 - `GET /`: Serves the main index.html file.
 
@@ -164,3 +164,12 @@ Before building and running the Paka server, ensure that you have the following 
 - It is recommended to consult the server's code and comments for more detailed information about its functionality and configuration.
 
 That's it! You have successfully built and run the Paka server. Feel free to explore its various endpoints and functionalities as needed.
+
+
+## FUTURE features and enbetterments
+
+* tls
+* finer grained perms on tokens
+* websocket interface
+* pub/sub
+* quality errors and error handling
