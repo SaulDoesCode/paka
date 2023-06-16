@@ -51,6 +51,14 @@ struct Token {
     bin: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct MakeTokenRequest{
+    count: Option<u64>,
+    pwd: String,
+    exp: Option<u64>,
+    payload: Option<Vec<u8>>,
+}
+
 #[post("/make-tokens/{count}")]
 async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpResponse {
     let admin_password = get_admin_password().expect("could not get admin password for token generation");
@@ -66,6 +74,49 @@ async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpRespons
             exp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1),
             bin: None,
         };
+        let hash = HASHER.hash(tkn.as_bytes());
+        let encoded_hash = B64.encode(&hash);
+        let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
+        match tokio::fs::File::create(&token_path).await {
+            Ok(mut f) => {
+                let bin = encrypt(&token).expect("could not encrypt token");
+                match f.write_all(&bin).await {
+                    Ok(_) => {
+                        // println!("Generated tkn {}", tkn);
+                        tokens.push(tkn);
+                    },
+                    Err(e) => {
+                        println!("Failed to write token to file: {}", e);
+                        if fs::remove_file(&token_path).is_ok() {
+                            println!("Removed failed token file");
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                println!("Failed to create token file at path {:?} : {}", token_path, e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        }
+    }
+    HttpResponse::Ok().json(tokens)
+}
+
+#[post("/mktn")]
+async fn make_token_request(mtr: web::Json<MakeTokenRequest>) -> HttpResponse {
+    let admin_password = get_admin_password().expect("could not get admin password for token generation");
+    if mtr.pwd != admin_password {
+        return HttpResponse::Unauthorized().finish();
+    }
+    let count = mtr.count.unwrap_or(1) as usize;
+    let payload = mtr.payload.clone();
+    let exp = mtr.exp.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1));
+    std::mem::forget(mtr);
+    let mut tokens = Vec::new();
+    while tokens.len() < count {
+        let tkn = random_string(24);
+        // generate a random token and save it to ./dist/{token}
+        let token = Token {exp, bin: payload.clone()};
         let hash = HASHER.hash(tkn.as_bytes());
         let encoded_hash = B64.encode(&hash);
         let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
@@ -218,7 +269,11 @@ async fn delete_file(req: HttpRequest, filename: web::Path<String>) -> HttpRespo
 }
 
 #[get("/static/{filename}")]
-async fn serve_static_files(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
+async fn srv_stc_files(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
+    serve_static_files(req, filename.into_inner()).await
+}
+
+async fn serve_static_files(req: HttpRequest, filename: String) -> HttpResponse {
     if let Some(ae) = req.headers().get(header::ACCEPT_ENCODING) {
         if let Ok(accept_encoding) = ae.to_str() {
             if accept_encoding.contains("gzip") {
@@ -340,12 +395,8 @@ fn compress_content(file: &NamedFile) -> Option<Vec<u8>> {
 }
 
 #[get("/")]
-async fn serve_index() -> HttpResponse {
-    // read and serve ./static/index.html
-    match fs::read(format!("{}index.html", STATIC_FILES_DIR)) {
-        Ok(data) => HttpResponse::Ok().content_type("text/html").body(data),
-        Err(_) => HttpResponse::NotFound().finish(),
-    }
+async fn serve_index(req: HttpRequest) -> HttpResponse {
+    serve_static_files(req, format!("{}index.html", STATIC_FILES_DIR)).await
 }
 
 fn get_query_param_value(query_string: &str, key: &str) -> Option<String> {
@@ -438,6 +489,7 @@ async fn main() -> io::Result<()> {
     HttpServer::new(|| {
         App::new()
             .service(generate_token)
+            .service(make_token_request)
             .service(change_password)
             .service(expire_tokens)
             .service(remove_gz_files)
@@ -446,9 +498,9 @@ async fn main() -> io::Result<()> {
             .service(delete_file)
             .service(download_file)
             .service(serve_index)
-            .service(serve_static_files)
+            .service(srv_stc_files)
     })
-    .bind_rustls(("0.0.0.0", 9797), tls_config)?
+    .bind_rustls(("0.0.0.0", 8000), tls_config)?
     .run().await
 }
 
@@ -459,8 +511,8 @@ fn load_rustls_config() -> rustls::ServerConfig {
         .with_no_client_auth();
 
     // load TLS key/cert files
-    let cert_file = &mut BufReader::new(fs::File::open(CERT_PEM).expect("Could not open cert file."));
-    let key_file = &mut BufReader::new(fs::File::open(PRIV_PEM).expect("Could not open key file."));
+    let cert_file = &mut BufReader::new(fs::File::open(CERT_PEM).expect(format!("Could not open cert file at {}.", CERT_PEM).as_str()));
+    let key_file = &mut BufReader::new(fs::File::open(PRIV_PEM).expect(format!("Could not open priv/key file at {}.", PRIV_PEM).as_str()));
 
     // convert files to key/cert objects
     let cert_chain = certs(cert_file)

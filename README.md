@@ -17,7 +17,7 @@ This documentation provides an overview and explanation of a Rust server impleme
 The Paka server is built using Actix Web, which is a lightweight and powerful web framework. It follows a modular structure and consists of the following main components:
 
 - **Main Function**: The entry point of the server, which initializes the Actix Web application and starts the server.
-- **Routes**: Defined using the `actix-web` macros, these routes map to different HTTP endpoints and handle incoming requests.
+- **Routes**: Defined using the `actix-web` macros, these routes map to different HTTPs (rustls, not RSA) endpoints and handle incoming requests.
 - **Token Generation**: Handles the generation and encryption of tokens used for authentication and file access.
 - **File Management**: Manages the uploading, downloading, and deletion of files on the server.
 - **Static Content Serving**: Handles the serving of static files such as HTML, CSS, JavaScript, and images.
@@ -45,7 +45,7 @@ The server provides a token generation functionality that allows the creation of
 
 tokens are hashed with sthash and the actual token you use it not saved on the server only its hash and meta-data, making it so that you can't read the token filenames and get free tokens.
 
-TODO: figure out how to safely hide the admin_pwd so that it doesn't need to be a text file, perhaps should require password be given from an http event or something so that the data is essentially encrypted fully at rest. one pwd to rule them all. still thinking about it. 
+TODO: figure out how to safely hide the admin_pwd so that it doesn't need to be a text file, perhaps should require password be given from an http event or something so that the data is essentially encrypted fully at rest. one pwd to rule them all. still thinking about it.
 
 ## File Management
 
@@ -73,7 +73,7 @@ The server initializes
 
 This documentation provides an overview of the Paka server's structure and functionality. For more detailed information, refer to the comments in the code itself.
 
-PORT is 9797
+PORT is 8000, you must put a cert.pem and priv.pem into ./secrets/ or set where the equivalent might be by changing the constants in the main.rs file for now. 
 
 ### Authentication Token Function
 
@@ -119,7 +119,7 @@ Before building and running the Paka server, ensure that you have the following 
 3. Run the following command to clone the repository:
 
    ```bash
-   git clone <repository_url>
+   git clone SaulDoesCode/paka
    ```
 
 ### Step 2: Navigate to the Project Directory
@@ -127,7 +127,7 @@ Before building and running the Paka server, ensure that you have the following 
 1. Change the current directory to the cloned repository's directory:
 
    ```bash
-   cd <repository_directory>
+   cd paka
    ```
 
 ### Step 3: Build the Paka Server
@@ -148,7 +148,7 @@ Before building and running the Paka server, ensure that you have the following 
    cargo run --release
    ```
 
-   This command starts the server and binds it to the default address `0.0.0.0:9797`.
+   This command starts the server and binds it to the default address `0.0.0.0:8000`.
 
    **Note:** If you want to bind the server to a specific address, modify the `bind` argument in the `HttpServer::bind` function call in the `main` function of the `main.rs` file before building the server.
 2. The Paka server is now running and ready to accept incoming requests.
@@ -157,9 +157,9 @@ Before building and running the Paka server, ensure that you have the following 
 
 1. Use an API testing tool (e.g., cURL, Postman) or a web browser to send HTTP requests to the Paka server.
 
-   - To generate tokens, send a POST request to `http://localhost:9797/make-tokens/{count}`, where `{count}` is the desired number of tokens to generate.
-   - To upload a file, send a POST request to `http://localhost:9797/file/{filename}` with the file contents in the request body.
-   - To download a file, send a GET request to `http://localhost:9797/file/{filename}`.
+   - To generate tokens, send a POST request to `https://localhost:8000/make-tokens/{count}`, where `{count}` is the desired number of tokens to generate.
+   - To upload a file, send a POST request to `https://localhost:8000/file/{filename}` with the file contents in the request body.
+   - To download a file, send a GET request to `https://localhost:8000/file/{filename}`.
    - For other available routes, refer to the server code or the provided documentation.
 2. The server will respond to the requests based on the implemented functionality and authentication mechanisms.
 
@@ -173,7 +173,6 @@ That's it! You have successfully built and run the Paka server. Feel free to exp
 
 ## FUTURE features and enbetterments
 
-* tls
 * finer grained perms on tokens
 * websocket interface
 * pub/sub
