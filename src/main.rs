@@ -346,8 +346,6 @@ fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpRespon
                 if let Some(compressed_content) = compress_content(&file) {
                     if let Err(err) = fs::write(&gzipped_file_path, compressed_content) {
                         eprintln!("Failed to write compressed file: {}", err);
-                    } else {
-                        return serve_gzipped_static_files(req, filename);
                     }
                 }
             }
@@ -355,24 +353,26 @@ fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpRespon
         }
     }
     // serve_gzipped_static_files(req, "./static/404.html".to_string())
-    let mut res = NamedFile::open(format!("{}404.html.gz", STATIC_FILES_DIR))
-        .expect("404 gzipped not even found")
-        .set_content_encoding(ContentEncoding::Gzip)
-        .into_response(&req);
-    res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
-    res.headers_mut().insert(
-        header::VARY,
-        header::HeaderValue::from_static("Accept-Encoding")
-    );
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/html")
-    );
-    res.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_static("inline")
-    );
-    res
+    if let Ok(nf) = NamedFile::open(format!("{}404.html.gz", STATIC_FILES_DIR)) {
+        let mut res = nf.set_content_encoding(ContentEncoding::Gzip)
+            .into_response(&req);
+        res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
+        res.headers_mut().insert(
+            header::VARY,
+            header::HeaderValue::from_static("Accept-Encoding")
+        );
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/html")
+        );
+        res.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static("inline")
+        );
+        res
+    } else {
+        NamedFile::open(format!("{}404.html", STATIC_FILES_DIR)).expect("404 itself was lost").into_response(&req)
+    }
 }
 
 fn should_compress(file: &NamedFile) -> bool {
@@ -396,7 +396,7 @@ fn compress_content(file: &NamedFile) -> Option<Vec<u8>> {
 
 #[get("/")]
 async fn serve_index(req: HttpRequest) -> HttpResponse {
-    serve_static_files(req, format!("{}index.html", STATIC_FILES_DIR)).await
+    serve_static_files(req, "index.html".to_string()).await
 }
 
 fn get_query_param_value(query_string: &str, key: &str) -> Option<String> {
@@ -484,7 +484,7 @@ async fn main() -> io::Result<()> {
         password
     });
 
-    let tls_config = load_rustls_config();
+    // let tls_config = load_rustls_config();
 
     HttpServer::new(|| {
         App::new()
@@ -500,7 +500,8 @@ async fn main() -> io::Result<()> {
             .service(serve_index)
             .service(srv_stc_files)
     })
-    .bind_rustls(("0.0.0.0", 8000), tls_config)?
+    //bind_rustls(("0.0.0.0", 9797), tls_config)?
+    .bind(("0.0.0.0", 9797))?
     .run().await
 }
 
