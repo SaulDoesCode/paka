@@ -2,4 +2,7 @@
 /*_pwd.txt
 /tokens
 /dist
+/secrets
 *.pem
+/static/*.gz
+nohup.out

@@ -1,183 +1,113 @@
-# Paka Server Documentation
+# Paka
 
-This documentation provides an overview and explanation of a Rust server implemented using Actix Web framework. The server is responsible for generating tokens, managing files, and serving static content.
-
-## Table of Contents
-
-- [Server Structure](#server-structure)
-- [API Endpoints](#api-endpoints)
-- [Token Generation](#token-generation)
-- [File Management](#file-management)
-- [Static Content Serving](#static-content-serving)
-- [Authentication](#authentication)
-- [Configuration](#configuration)
-
-## Server Structure
-
-The Paka server is built using Actix Web, which is a lightweight and powerful web framework. It follows a modular structure and consists of the following main components:
-
-- **Main Function**: The entry point of the server, which initializes the Actix Web application and starts the server.
-- **Routes**: Defined using the `actix-web` macros, these routes map to different HTTPs (rustls, not RSA) endpoints and handle incoming requests.
-- **Token Generation**: Handles the generation and encryption of tokens used for authentication and file access.
-- **File Management**: Manages the uploading, downloading, and deletion of files on the server.
-- **Static Content Serving**: Handles the serving of static files such as HTML, CSS, JavaScript, and images.
-- **Authentication**: Verifies the validity of tokens for accessing protected endpoints.
-- **Configuration**: Handles the configuration settings of the server, including admin password and file paths.
-
-## API Endpoints
-
-The server exposes the following API endpoints:
-
-- `POST /make-tokens/{count}`: Generates a specified number of tokens for authentication purposes.
-- `POST /admin/change-password`: Changes the admin password.
-- `GET /file-info/{filename}?tk=TOKENSTRING`: Retrieves information about a file.
-- `POST /file/{filename}?tk=TOKENSTRING`: Uploads a file to the server.
-- `GET /file/{filename}?tk=TOKENSTRING`: Downloads a file from the server.
-- `DELETE /file/{filename}?tk=TOKENSTRING`: Deletes a file from the server.
-- `GET /static/{filename}`: Serves static files such as HTML, CSS, JavaScript, and images.
-- `GET /`: Serves the main index.html file.
+A small token-gated file server. An admin hands out tokens; every request to read, write, delete or list files spends one. Files and token metadata are encrypted at rest.
 
 [paka-works.png](https://postimg.cc/kBQ4gTYP)
 
-## Token Generation
+## Running
 
-The server provides a token generation functionality that allows the creation of tokens for authentication and file access. Tokens are generated using a POST request to the `/make-tokens/{count}` endpoint. The provided admin password is validated, and if correct, the specified number of tokens is generated and saved as files on the server. Tokens are valid for a day (timestamp code you can change it, will eventually make things configurable by less baked in means), and they are use once, the tokens that is.
+```sh
+cargo run --release
+```
 
-tokens are hashed with sthash and the actual token you use it not saved on the server only its hash and meta-data, making it so that you can't read the token filenames and get free tokens.
+On first start Paka prints a generated admin password **once** (only its argon2 hash is stored). To set your own, or to recover a lost one, start it with `PAKA_ADMIN_PWD=...`.
 
-TODO: figure out how to safely hide the admin_pwd so that it doesn't need to be a text file, perhaps should require password be given from an http event or something so that the data is essentially encrypted fully at rest. one pwd to rule them all. still thinking about it.
+Open `http://localhost:9797/` for the web UI: generate tokens with the admin password, then upload, list, download and delete files with them.
 
-## File Management
+### Configuration
 
-The server enables file management functionalities, including file upload, download, and deletion. Files are uploaded using a POST request to the `/file/{filename}` endpoint, where the file is encrypted and saved on the server. Files can be downloaded using a GET request to the same endpoint, and deleted using a DELETE request.
+| env var | default | |
+|---|---|---|
+| `PAKA_ADDR` | `0.0.0.0` | bind address |
+| `PAKA_PORT` | `9797` | port |
+| `PAKA_CERT` / `PAKA_KEY` | `./secrets/cert.pem` / `./secrets/priv.pem` | if these exist Paka serves HTTPS (rustls), otherwise plain HTTP |
+| `PAKA_MAX_UPLOAD_MB` | `64` | largest accepted upload |
+| `PAKA_TOKEN_TTL` | `86400` | default token lifetime in seconds |
+| `PAKA_ADMIN_PWD` | | sets the admin password on startup |
 
-## Static Content Serving
+### Files on disk
 
-The server serves static files stored in the `./static` directory. When a GET request is made to the `/static/{filename}` endpoint, the corresponding file is served. If the file can be compressed (based on its MIME type), it is compressed and served with the appropriate Content-Encoding header.
+| path | |
+|---|---|
+| `secrets/master.key` | random 32 byte key that encrypts everything. **Back it up**: without it the files can't be read. |
+| `admin_pwd.txt` | argon2 hash of the admin password |
+| `tokens/` | one file per token, named by a keyed hash of the token so the names can't be used as tokens |
+| `dist/` | uploaded files, encrypted (ChaCha20-Poly1305) |
+| `static/` | the web UI and `paka.mjs`, gzipped in memory when served |
 
-## Authentication
+Upgrading from the old version, where `admin_pwd.txt` held the plaintext password and encrypted the files: on first start Paka re-encrypts `dist/` with the new master key and hashes the password (it stays the same). Old tokens are dropped.
 
-To access protected endpoints, clients must include a valid token in the query parameters of the request. The token is validated by checking its existence and expiration time. If the token is valid, the client is granted access to the protected endpoint. Tokens are removed from the server after being used or if they expire.
+## Tokens
 
-## Configuration
+Tokens are single use and live for a day by default. With `/mktn` you can also give them several uses, a custom lifetime, restrict them to one file or to some operations, and attach a JSON payload the token holder can read back.
 
-The server allows configuration through the following settings:
+Pass a token as `?tk=TOKEN` or in an `x-paka-token` header. A token is spent when a request is authorised, even if the file then turns out not to exist. A request outside a token's scope is refused with 403 and doesn't spend it.
 
-- `ADMIN_PWD_FILE_PATH`: Path to the file storing the admin password.
-- `TOKENS_DIR`: Directory where generated tokens are stored.
-- `GZIPABLE_TYPES`: Array of MIME types that can be compressed when serving static files.
+## API
 
-The server initializes
+Admin routes (wrong password → 401):
 
- with an admin password, which can be changed using the `/admin/change-password` endpoint. The admin password is stored in the `ADMIN_PWD_FILE_PATH` file.
+| route | body | returns |
+|---|---|---|
+| `POST /make-tokens/{count}` | admin password | `["token", ...]` single use, default lifetime |
+| `POST /mktn` | JSON, see below | `["token", ...]` |
+| `POST /expire-tokens` | admin password | `{"removed": n}` deletes expired tokens (also done hourly) |
+| `POST /revoke-tokens` | admin password | `{"removed": n}` deletes all tokens |
+| `POST /admin/change-password` | `{"pwd": "...", "new_pwd": "..."}` | `{"ok": true}` |
+| `POST /remove-gz-files` | admin password | `{"cleared": n}` clears the static gzip cache |
 
-This documentation provides an overview of the Paka server's structure and functionality. For more detailed information, refer to the comments in the code itself.
+`/mktn` body, everything but `pwd` optional:
 
-PORT is 8000, you must put a cert.pem and priv.pem into ./secrets/ or set where the equivalent might be by changing the constants in the main.rs file for now. 
+```json
+{
+  "pwd": "admin password",
+  "count": 10,
+  "uses": 3,
+  "ttl": 3600,
+  "exp": 1790000000,
+  "file": "report.pdf",
+  "ops": ["read", "write", "delete", "list"],
+  "payload": {"anything": "json"}
+}
+```
 
-### Authentication Token Function
+`exp` is an absolute unix time and wins over `ttl` (seconds from now). At most 1000 tokens per request.
 
-The authentication token function is responsible for verifying the validity of a given token. Here's an overview of what happens in this function:
+Token routes:
 
-1. The function receives a token as input.
-2. It first checks if the token exists and is not empty. If the token is missing or empty, the authentication fails.
-3. Next, the function decrypts the token to retrieve the payload, which contains information such as the token's creation time and expiration time.
-4. The function checks if the token has expired by comparing the current Unix time (in seconds) with the expiration time stored in the payload.
-5. If the token has expired, the authentication fails.
-6. If the token is valid and has not expired, the authentication succeeds, and the function returns a boolean value indicating the result.
+| route | op | returns |
+|---|---|---|
+| `GET /token?tk=` | — | `{exp, uses, file, ops, payload}` without spending the token |
+| `GET /files?tk=` | list | `[{filename, size, modified}]` |
+| `GET /file-info/{name}?tk=` | read | `{filename, size, modified}` |
+| `GET /file/{name}?tk=` | read | the file, as an attachment |
+| `POST /file/{name}?tk=` | write | uploads/overwrites, body is the file |
+| `DELETE /file/{name}?tk=` | delete | `{"deleted": name}` |
 
-### Token Making Route
+File names are plain names: no `/` or `\`, no leading `.`, at most 255 bytes. Errors come back as `{"error": "..."}`.
 
-The token-making route is responsible for generating tokens based on the specified count. Here's an overview of what happens in this route:
+Static: `GET /` serves `static/index.html`, `GET /static/{name}` serves `static/`.
 
-1. The route receives a POST request to the `/make-tokens/{count}` endpoint, where `{count}` is the desired number of tokens to generate.
-2. The provided admin password is extracted from the request.
-3. The admin password is compared against the stored admin password (usually read from the `ADMIN_PWD_FILE_PATH` file) to verify its correctness.
-4. If the admin password is incorrect, the route returns an appropriate error response.
-5. If the admin password is correct, the route generates the specified number of tokens.
-6. Each token consists of a payload containing the creation time and expiration time. The creation time is set to the current Unix time (in seconds), and the expiration time is calculated by adding 3600 seconds (1 hour) to the creation time.
-7. The tokens are then encrypted and saved as files on the server, typically in the `TOKENS_DIR` directory.
-8. The route returns a success response indicating the number of tokens generated.
+## paka.mjs
 
-The inclusion of the expiry check and the calculation involving Unix time is important for ensuring the security and validity of the generated tokens. By setting an expiration time, the tokens become valid only for a specific duration, reducing the risk of unauthorized access if a token is compromised.
+A browser client, served at `/static/paka.mjs`:
 
-## Building and Running the Paka Server
+```js
+import paka from '/static/paka.mjs'
 
-The Paka server is a Rust-based server that provides various functionalities such as token generation, file upload, and download. Follow the instructions below to build and run the Paka server.
+const tokens = await paka.makeTokens(adminPwd, 3)
+// or paka.makeTokenRequest({ pwd: adminPwd, count: 3, uses: 2, ops: ['read'] })
 
-### Prerequisites
+const client = paka('/file/', tokens)
+client.ifTaking(() => localStorage.setItem('tokens', JSON.stringify(client.tokens)))
 
-Before building and running the Paka server, ensure that you have the following dependencies installed:
+await client.post('notes.txt', 'music is cool')
+const text = await (await client.get('notes.txt')).text()
+await client.delete('notes.txt')
+```
 
-- Rust (stable version)
-- Cargo (Rust's package manager)
+Client methods `get`, `post`, `delete`, `info`, `list` each spend one token and return the `fetch` Response; `tokenInfo()` checks a token for free. `feed(...tokens)` adds tokens, `tokens` shows what's left. Admin helpers: `paka.expireTokens`, `paka.revokeTokens`, `paka.changePassword`, `paka.clearStaticCache`.
 
-### Step 1: Clone the Repository
+## License
 
-1. Open your terminal or command prompt.
-2. Change the current directory to the location where you want to clone the repository.
-3. Run the following command to clone the repository:
-
-   ```bash
-   git clone SaulDoesCode/paka
-   ```
-
-### Step 2: Navigate to the Project Directory
-
-1. Change the current directory to the cloned repository's directory:
-
-   ```bash
-   cd paka
-   ```
-
-### Step 3: Build the Paka Server
-
-1. Run the following command to build the Paka server:
-
-   ```bash
-   cargo build --release
-   ```
-
-   This command compiles the server code and its dependencies, creating an optimized release build.
-
-### Step 4: Run the Paka Server
-
-1. After successful build, run the following command to start the Paka server:
-
-   ```bash
-   cargo run --release
-   ```
-
-   This command starts the server and binds it to the default address `0.0.0.0:8000`.
-
-   **Note:** If you want to bind the server to a specific address, modify the `bind` argument in the `HttpServer::bind` function call in the `main` function of the `main.rs` file before building the server.
-2. The Paka server is now running and ready to accept incoming requests.
-
-### Step 5: Interacting with the Paka Server
-
-1. Use an API testing tool (e.g., cURL, Postman) or a web browser to send HTTP requests to the Paka server.
-
-   - To generate tokens, send a POST request to `https://localhost:8000/make-tokens/{count}`, where `{count}` is the desired number of tokens to generate.
-   - To upload a file, send a POST request to `https://localhost:8000/file/{filename}` with the file contents in the request body.
-   - To download a file, send a GET request to `https://localhost:8000/file/{filename}`.
-   - For other available routes, refer to the server code or the provided documentation.
-2. The server will respond to the requests based on the implemented functionality and authentication mechanisms.
-
-### Additional Notes
-
-- The Paka server stores tokens and files in the specified directories (`TOKENS_DIR` and `./dist/`, respectively) relative to the server's execution location.
-- You can customize various server configurations, such as the admin password file path and the types of files that should be compressed, by modifying the respective constants in the server's code.
-- It is recommended to consult the server's code and comments for more detailed information about its functionality and configuration.
-
-That's it! You have successfully built and run the Paka server. Feel free to explore its various endpoints and functionalities as needed.
-
-## FUTURE features and enbetterments
-
-* finer grained perms on tokens
-* websocket interface
-* pub/sub
-* quality errors and error handling
-
-## HELP OUT
-
-[ko-fi.com/saulvdw]()
+MIT
