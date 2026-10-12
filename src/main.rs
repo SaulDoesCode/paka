@@ -1,537 +1,426 @@
 use mimalloc::MiMalloc;
-use tokio::io::AsyncWriteExt;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{io::{self, Read, Write, BufReader}, fs, path::{Path, PathBuf}, sync::Mutex};
-use actix_web::{get, delete, post, web, App, HttpResponse, HttpServer, HttpRequest, http::header::{ContentEncoding, self}};
-use actix_files::NamedFile;
-use base64::{Engine as _};
-use cocoon::{Cocoon};
-use flate2::{Compression, write::GzEncoder};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use rustls::{Certificate, PrivateKey, ServerConfig};
-use rustls_pemfile::{certs, pkcs8_private_keys};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tempfile::NamedTempFile;
+mod config;
+mod crypto;
+mod statics;
+mod tokens;
 
+use std::{fs, io, path::PathBuf, time::Duration};
 
-const ADMIN_PWD_FILE_PATH: &str = "./admin_pwd.txt";
-const TOKENS_DIR: &str = "./tokens";
-const STATIC_FILES_DIR: &str = "./static/";
-const CERT_PEM: &str = "./secrets/cert.pem";
-const PRIV_PEM: &str = "./secrets/priv.pem";
-const GZIPABLE_TYPES: [&str; 8] = [
-    "text/html",
-    "text/css",
-    "text/javascript",
-    "image/svg+xml",
-    "application/javascript",
-    "application/x-javascript",
-    "application/xml",
-    "application/json",
-];
+use salvo::{
+    catcher::Catcher,
+    conn::rustls::{Keycert, RustlsConfig},
+    http::{header, ParseError, StatusCode},
+    hyper::body::Bytes,
+    prelude::*,
+};
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::{json, Value};
 
-lazy_static::lazy_static! {
-    static ref ADMIN_PASSWORD: Mutex<String> = Mutex::new(get_admin_password().unwrap_or_else(|| generate_admin_password()));
-    static ref HASHER: sthash::Hasher = {
-        let key = get_admin_password().expect("could not get admin password for the hasher").as_bytes().to_vec();
-        sthash::Hasher::new(sthash::Key::from_seed(key.as_slice(), None), None)
-    };
-    static ref B64: base64::engine::GeneralPurpose = {
-        let abc = base64::alphabet::Alphabet::new("+_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").expect("aplhabet was too much for base64, sorry");
-        base64::engine::GeneralPurpose::new(&abc, base64::engine::general_purpose::GeneralPurposeConfig::new().with_encode_padding(false).with_decode_allow_trailing_bits(true))
-    };
+use config::MAX_TOKENS_PER_REQUEST;
+use tokens::{AuthError, Op, Token};
+
+/// Admin passwords and JSON bodies are small; only uploads get the big limit.
+const SMALL_BODY: usize = 1024 * 1024;
+
+/// An error response: `{"error": "..."}` with a status code.
+struct ApiError(StatusCode, String);
+
+impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+        ApiError(status, msg.into())
+    }
+
+    fn internal(e: impl std::fmt::Display) -> Self {
+        eprintln!("internal error: {e}");
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Token {
-    exp: u64,
-    bin: Option<Vec<u8>>,
+impl From<ParseError> for ApiError {
+    fn from(e: ParseError) -> Self {
+        match e {
+            ParseError::PayloadTooLarge => ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+            e => ApiError::new(StatusCode::BAD_REQUEST, e.to_string()),
+        }
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct MakeTokenRequest{
-    count: Option<u64>,
+impl From<AuthError> for ApiError {
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::Invalid => ApiError::new(StatusCode::UNAUTHORIZED, "invalid or used up token"),
+            AuthError::Expired => ApiError::new(StatusCode::UNAUTHORIZED, "token expired"),
+            AuthError::OutOfScope => ApiError::new(StatusCode::FORBIDDEN, "token not valid for this request"),
+        }
+    }
+}
+
+impl Scribe for ApiError {
+    fn render(self, res: &mut Response) {
+        res.status_code(self.0);
+        res.render(Json(json!({ "error": self.1 })));
+    }
+}
+
+type ApiResult = Result<Json<Value>, ApiError>;
+
+/// Runs blocking work (file IO, crypto, argon2) off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f).await.map_err(ApiError::internal)
+}
+
+/// Parses a JSON body regardless of its Content-Type.
+async fn json_body<T: DeserializeOwned>(req: &mut Request) -> Result<T, ApiError> {
+    let body = req.payload_with_max_size(SMALL_BODY).await?;
+    serde_json::from_slice(body).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))
+}
+
+// ---- admin ----
+
+async fn check_admin(pwd: Vec<u8>) -> Result<(), ApiError> {
+    if blocking(move || crypto::verify_admin_password(&pwd)).await? {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong admin password"))
+    }
+}
+
+/// Older routes take the admin password as the raw request body.
+async fn check_body_admin(req: &mut Request) -> Result<(), ApiError> {
+    let body = req.payload_with_max_size(SMALL_BODY).await?;
+    check_admin(String::from_utf8_lossy(body).trim().as_bytes().to_vec()).await
+}
+
+#[derive(Deserialize)]
+struct MakeTokenRequest {
     pwd: String,
+    count: Option<usize>,
+    /// absolute expiry in unix seconds
     exp: Option<u64>,
-    payload: Option<Vec<u8>>,
+    /// expiry in seconds from now, used if exp is not given
+    ttl: Option<u64>,
+    /// how many requests the token can be used for (default 1)
+    uses: Option<u32>,
+    /// restrict the token to a single file name
+    file: Option<String>,
+    /// restrict the token to some of: read, write, delete, list
+    ops: Option<Vec<Op>>,
+    /// any JSON, handed back by GET /token
+    payload: Option<Value>,
 }
 
-#[post("/make-tokens/{count}")]
-async fn generate_token(count: web::Path<usize>, pwd: web::Bytes) -> HttpResponse {
-    let admin_password = get_admin_password().expect("could not get admin password for token generation");
-    if pwd != admin_password.as_bytes() {
-        return HttpResponse::Unauthorized().finish();
+async fn make_tokens(count: usize, spec: Token) -> ApiResult {
+    if count == 0 || count > MAX_TOKENS_PER_REQUEST {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("count must be between 1 and {MAX_TOKENS_PER_REQUEST}"),
+        ));
     }
-    let count = count.into_inner();
-    let mut tokens = Vec::new();
-    while tokens.len() < count {
-        // generate a random token and save it to ./dist/{token}
-        let tkn = random_string(24);
-        let token = Token {
-            exp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1),
-            bin: None,
-        };
-        let hash = HASHER.hash(tkn.as_bytes());
-        let encoded_hash = B64.encode(&hash);
-        let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
-        match tokio::fs::File::create(&token_path).await {
-            Ok(mut f) => {
-                let bin = encrypt(&token).expect("could not encrypt token");
-                match f.write_all(&bin).await {
-                    Ok(_) => {
-                        // println!("Generated tkn {}", tkn);
-                        tokens.push(tkn);
-                    },
-                    Err(e) => {
-                        println!("Failed to write token to file: {}", e);
-                        if fs::remove_file(&token_path).is_ok() {
-                            println!("Removed failed token file");
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                println!("Failed to create token file at path {:?} : {}", token_path, e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        }
-    }
-    HttpResponse::Ok().json(tokens)
+    let tokens = blocking(move || tokens::create(&spec, count)).await?.map_err(ApiError::internal)?;
+    Ok(Json(json!(tokens)))
 }
 
-#[post("/mktn")]
-async fn make_token_request(mtr: web::Json<MakeTokenRequest>) -> HttpResponse {
-    let admin_password = get_admin_password().expect("could not get admin password for token generation");
-    if mtr.pwd != admin_password {
-        return HttpResponse::Unauthorized().finish();
-    }
-    let count = mtr.count.unwrap_or(1) as usize;
-    let payload = mtr.payload.clone();
-    let exp = mtr.exp.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + ((3600 * 24) * 1));
-    std::mem::forget(mtr);
-    let mut tokens = Vec::new();
-    while tokens.len() < count {
-        let tkn = random_string(24);
-        // generate a random token and save it to ./dist/{token}
-        let token = Token {exp, bin: payload.clone()};
-        let hash = HASHER.hash(tkn.as_bytes());
-        let encoded_hash = B64.encode(&hash);
-        let token_path: PathBuf = format!("{}/{}", TOKENS_DIR, encoded_hash).parse().expect("could not parse token path");
-        match tokio::fs::File::create(&token_path).await {
-            Ok(mut f) => {
-                let bin = encrypt(&token).expect("could not encrypt token");
-                match f.write_all(&bin).await {
-                    Ok(_) => {
-                        // println!("Generated tkn {}", tkn);
-                        tokens.push(tkn);
-                    },
-                    Err(e) => {
-                        println!("Failed to write token to file: {}", e);
-                        if fs::remove_file(&token_path).is_ok() {
-                            println!("Removed failed token file");
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                println!("Failed to create token file at path {:?} : {}", token_path, e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        }
-    }
-    HttpResponse::Ok().json(tokens)
+#[handler]
+async fn make_tokens_simple(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    let count = req.param::<usize>("count").ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "count must be a number"))?;
+    let spec = Token { exp: config::now() + config::get().token_ttl_secs, uses: 1, file: None, ops: None, payload: None };
+    make_tokens(count, spec).await
 }
 
-#[post("/expire-tokens")]
-async fn expire_tokens(pwd: web::Bytes) -> HttpResponse {
-    let admin_password = ADMIN_PASSWORD.lock().unwrap();
-    // validate admin password from bytes
-    if pwd != admin_password.as_bytes() {
-        return HttpResponse::Unauthorized().finish();
+#[handler]
+async fn make_tokens_custom(req: &mut Request) -> ApiResult {
+    let req: MakeTokenRequest = json_body(req).await?;
+    check_admin(req.pwd.into_bytes()).await?;
+    let bad = |msg: &str| Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
+    let exp = req.exp.unwrap_or_else(|| config::now().saturating_add(req.ttl.unwrap_or(config::get().token_ttl_secs)));
+    if exp <= config::now() {
+        return bad("exp must be in the future");
     }
-
-    let mut expired_tokens = Vec::new();
-    if let Ok(entries) = fs::read_dir(TOKENS_DIR) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if metadata.is_file() {
-                        let token = decrypt::<Token>(&fs::read(&path).unwrap());
-                        if let Some(token) = token {
-                            if token.exp < std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
-                                if fs::remove_file(&path).is_ok() {
-                                    expired_tokens.push(path.file_name().unwrap().to_str().unwrap().to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let uses = req.uses.unwrap_or(1);
+    if uses == 0 {
+        return bad("uses must be at least 1");
     }
-
-    HttpResponse::Ok().json(expired_tokens)
+    if req.file.as_deref().is_some_and(|f| !config::valid_filename(f)) {
+        return bad("invalid file name");
+    }
+    let payload = req.payload.map(|p| p.to_string());
+    let spec = Token { exp, uses, file: req.file, ops: req.ops, payload };
+    make_tokens(req.count.unwrap_or(1), spec).await
 }
 
-fn encrypt<T: Serialize>(payload: T) -> Option<Vec<u8>> {
-    let admin_password = get_admin_password().unwrap();
-    let mut serialized_payload = bincode::serialize(&payload).unwrap();
-    let cocoon = Cocoon::new(admin_password.as_bytes());
-    let detached_prefix = cocoon.encrypt(&mut serialized_payload).unwrap();
-    let whole = bincode::serialize(&(serialized_payload.to_vec(), detached_prefix.to_vec())).unwrap();
-    Some(whole)
+#[handler]
+async fn expire_tokens(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "removed": blocking(tokens::remove_expired).await? })))
 }
 
-fn decrypt<'a, T: serde::de::DeserializeOwned>(
-    whole: &'a [u8]
-) -> Option<T> {
-    let admin_password = get_admin_password().unwrap();
-    let (encrypted_payload, detached_prefix): (Vec<u8>, Vec<u8>) = bincode::deserialize(whole).unwrap();
-    let mut decrypted_payload = encrypted_payload;
-    let cocoon = Cocoon::new(admin_password.as_bytes());
-    if cocoon.decrypt(decrypted_payload.as_mut_slice(), &detached_prefix).is_ok() {
-        bincode::deserialize(&decrypted_payload).ok()
-    } else {
-        None
+#[handler]
+async fn revoke_tokens(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "removed": blocking(tokens::revoke_all).await? })))
+}
+
+#[handler]
+async fn remove_gz_files(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "cleared": statics::clear_cache() })))
+}
+
+#[derive(Deserialize)]
+struct ChangePassword {
+    pwd: String,
+    new_pwd: String,
+}
+
+#[handler]
+async fn change_password(req: &mut Request) -> ApiResult {
+    let ChangePassword { pwd, new_pwd } = json_body(req).await?;
+    check_admin(pwd.into_bytes()).await?;
+    let new_pwd = new_pwd.trim().to_string();
+    if new_pwd.len() < 8 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "new password must be at least 8 characters"));
     }
+    blocking(move || crypto::set_admin_password(&new_pwd)).await?.map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
-#[post("/admin/change-password")]
-async fn change_password(new_password: web::Json<String>) -> HttpResponse {
-    let mut admin_password = ADMIN_PASSWORD.lock().unwrap();
-    *admin_password = new_password.into_inner();
-    set_admin_password(&admin_password).unwrap();
-    HttpResponse::Ok().finish()
+// ---- token holders ----
+
+/// The token comes from `?tk=` or the `x-paka-token` header.
+fn token_of(req: &Request) -> Result<String, ApiError> {
+    req.query::<String>("tk")
+        .or_else(|| req.header::<String>("x-paka-token"))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "missing token, pass ?tk=TOKEN"))
 }
 
-#[get("/file-info/{filename}")]
-async fn get_file_info(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    if !authenticate_token(&req) {
-        return HttpResponse::Unauthorized().finish();
-    }
+/// Spends a token for `op` on `file`.
+async fn authorize(req: &Request, op: Op, file: Option<&str>) -> Result<Token, ApiError> {
+    let tk = token_of(req)?;
+    let file = file.map(str::to_string);
+    Ok(blocking(move || tokens::consume(&tk, op, file.as_deref())).await??)
+}
 
-    let path = format!("./dist/{}", filename);
-
-    let file_info = fs::metadata(&path)
-        .map(|metadata| {
-            json!({
-                "filename": filename.as_str(),
-                "size": metadata.len(),
-            })
+/// The `{filename}` route param, validated, and its path in `dist/`.
+fn file_param(req: &Request) -> Result<(String, PathBuf), ApiError> {
+    req.param::<String>("filename")
+        .filter(|name| config::valid_filename(name))
+        .map(|name| {
+            let path = PathBuf::from(config::DIST_DIR).join(&name);
+            (name, path)
         })
-        .unwrap_or_else(|_| json!({"error": "File not found"}));
-
-    HttpResponse::Ok().json(file_info)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid file name"))
 }
 
-#[post("/file/{filename}")]
-async fn upload_file(req: HttpRequest, filename: web::Path<String>, payload: web::Bytes) -> HttpResponse {
-    if !authenticate_token(&req) {
-        return HttpResponse::Unauthorized().finish();
-    }
-    let path = format!("./dist/{}", filename);
-    let mut file = NamedTempFile::new().unwrap();
-    file.write_all(&encrypt(&*payload).unwrap()).unwrap();
-    file.persist(Path::new(&path)).unwrap();
-    HttpResponse::Ok().finish()
+fn not_found_file() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "file not found")
 }
 
-#[get("/file/{filename}")]
-async fn download_file(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    if !authenticate_token(&req) {
-        return HttpResponse::Unauthorized().finish();
-    }
-
-    let path = format!("./dist/{}", filename);
-
-    match fs::read(&path) {
-        Ok(data) => HttpResponse::Ok().body(decrypt::<Vec<u8>>(&data).expect("Failed to decrypt file, might be the pwd changed")),
-        Err(_) => HttpResponse::NotFound().finish(),
-    }
+fn file_json(name: &str, meta: &fs::Metadata) -> Value {
+    let modified = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    json!({ "filename": name, "size": crypto::plaintext_len(meta.len()), "modified": modified })
 }
 
-#[delete("/file/{filename}")]
-async fn delete_file(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    if !authenticate_token(&req) {
-        return HttpResponse::Unauthorized().finish();
-    }
-
-    let path = format!("./dist/{}", filename);
-
-    match fs::remove_file(&path) {
-        Ok(_) => HttpResponse::Ok().finish(),
-        Err(_) => HttpResponse::NotFound().finish(),
-    }
+#[handler]
+async fn token_info(req: &mut Request) -> ApiResult {
+    let tk = token_of(req)?;
+    let t = blocking(move || tokens::peek(&tk)).await??;
+    Ok(Json(json!({
+        "exp": t.exp,
+        "uses": t.uses,
+        "file": t.file,
+        "ops": t.ops,
+        "payload": t.payload.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+    })))
 }
 
-#[get("/static/{filename}")]
-async fn srv_stc_files(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    serve_static_files(req, filename.into_inner()).await
+#[handler]
+async fn list_files(req: &mut Request) -> ApiResult {
+    authorize(req, Op::List, None).await?;
+    let files = blocking(|| -> io::Result<Vec<Value>> {
+        let mut files: Vec<_> = fs::read_dir(config::DIST_DIR)?
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok().filter(|n| config::valid_filename(n))?;
+                let meta = e.metadata().ok().filter(|m| m.is_file())?;
+                Some(file_json(&name, &meta))
+            })
+            .collect();
+        files.sort_by(|a, b| a["filename"].as_str().cmp(&b["filename"].as_str()));
+        Ok(files)
+    })
+    .await?
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!(files)))
 }
 
-async fn serve_static_files(req: HttpRequest, filename: String) -> HttpResponse {
-    if let Some(ae) = req.headers().get(header::ACCEPT_ENCODING) {
-        if let Ok(accept_encoding) = ae.to_str() {
-            if accept_encoding.contains("gzip") {
-                return serve_gzipped_static_files(&req, filename.to_string());
-            }
-        }
-    }
-
-    let file_path = format!("{}{}", STATIC_FILES_DIR, filename);
-    if let Ok(file) = NamedFile::open(&file_path) {
-        return file.into_response(&req);
-    }
-
-    NamedFile::open(format!("{}404.html", STATIC_FILES_DIR)).expect("404 itself was lost").into_response(&req)
-}
-
-#[post("/remove-gz-files")]
-async fn remove_gz_files(pwd: web::Bytes) -> HttpResponse {
-    if let Some(ap) = get_admin_password() {
-        if ap.as_bytes() != pwd {
-            return HttpResponse::Unauthorized().finish();
-        }
-    } else {
-        return HttpResponse::Unauthorized().finish();
-    }
-    // look in the ./static directory and remove all the files that end with .gz
-    let static_dir = Path::new("./static");
-    if let Ok(entries) = fs::read_dir(static_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == "gz" {
-                        if let Err(e) = fs::remove_file(path) {
-                            println!("Failed to remove file: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    HttpResponse::Ok().finish()
-}
-
-fn serve_gzipped_static_files(req: &HttpRequest, filename: String) -> HttpResponse {
-    let file_path = format!("{}{}", STATIC_FILES_DIR, filename);
-    let gzipped_file_path = format!("{}.gz", &file_path);
-    let ct = mime_guess::from_path(&file_path).first_or_octet_stream();
-    if let Ok(file) = NamedFile::open(&gzipped_file_path) {
-        let mut res = file.set_content_encoding(ContentEncoding::Gzip).into_response(req);
-        res.headers_mut().insert(
-            header::VARY,
-            header::HeaderValue::from_static("Accept-Encoding")
-        );
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_str(&ct.to_string()).unwrap()
-        );
-        if filename.starts_with("404") {
-            res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
-        }
-        res.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            header::HeaderValue::from_static("inline")
-        );
-        return res;
-    } else if Path::new(&file_path).exists() {
-        if let Ok(file) = NamedFile::open(&file_path) {
-            if should_compress(&file) {
-                if let Some(compressed_content) = compress_content(&file) {
-                    if let Err(err) = fs::write(&gzipped_file_path, compressed_content) {
-                        eprintln!("Failed to write compressed file: {}", err);
-                    }
-                }
-            }
-            return file.into_response(req);
-        }
-    }
-    // serve_gzipped_static_files(req, "./static/404.html".to_string())
-    if let Ok(nf) = NamedFile::open(format!("{}404.html.gz", STATIC_FILES_DIR)) {
-        let mut res = nf.set_content_encoding(ContentEncoding::Gzip)
-            .into_response(&req);
-        res.head_mut().status = actix_web::http::StatusCode::NOT_FOUND;
-        res.headers_mut().insert(
-            header::VARY,
-            header::HeaderValue::from_static("Accept-Encoding")
-        );
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("text/html")
-        );
-        res.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            header::HeaderValue::from_static("inline")
-        );
-        res
-    } else {
-        NamedFile::open(format!("{}404.html", STATIC_FILES_DIR)).expect("404 itself was lost").into_response(&req)
+#[handler]
+async fn file_info(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Read, Some(&name)).await?;
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() => Ok(Json(file_json(&name, &meta))),
+        _ => Err(not_found_file()),
     }
 }
 
-fn should_compress(file: &NamedFile) -> bool {
-    let mime_type = file.content_type();
-    GZIPABLE_TYPES.contains(&mime_type.to_string().as_str())
-}
-
-fn compress_content(file: &NamedFile) -> Option<Vec<u8>> {
-    let mut file = file.file();
-    let mut content = Vec::new();
-    if let Ok(_) = file.read_to_end(&mut content) {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        if let Ok(_) = encoder.write_all(&content) {
-            if let Ok(compressed) = encoder.finish() {
-                return Some(compressed);
-            }
-        }
+#[handler]
+async fn upload_file(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    let max = config::get().max_upload_bytes;
+    // reject declared oversize uploads before spending the token
+    if req.header::<usize>(header::CONTENT_LENGTH).is_some_and(|len| len > max) {
+        return Err(ParseError::PayloadTooLarge.into());
     }
-    None
+    authorize(req, Op::Write, Some(&name)).await?;
+    let body = req.payload_with_max_size(max).await?.clone();
+    let size = body.len();
+    blocking(move || crypto::encrypt(&body).and_then(|enc| crypto::write_atomic(&path, &enc)))
+        .await?
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "filename": name, "size": size })))
 }
 
-#[get("/")]
-async fn serve_index(req: HttpRequest) -> HttpResponse {
-    serve_static_files(req, "index.html".to_string()).await
-}
-
-fn get_query_param_value(query_string: &str, key: &str) -> Option<String> {
-    let params: Vec<&str> = query_string.split('&').collect();
-    for param in params {
-        let parts: Vec<&str> = param.split('=').collect();
-        if parts.len() == 2 && parts[0] == key {
-            return Some(parts[1].to_string());
-        }
-    }
-    None
-}
-
-fn authenticate_token(req: &HttpRequest) -> bool {
-    let token = match get_query_param_value(&req.query_string(), "tk") {
-        Some(tkn) => B64.encode(&HASHER.hash(tkn.as_bytes())),
-        _ => return false,
+#[handler]
+async fn download_file(req: &mut Request, res: &mut Response) -> Result<(), ApiError> {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Read, Some(&name)).await?;
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(not_found_file()),
+        Err(e) => return Err(ApiError::internal(e)),
     };
-    
-    let token_file_path = format!("{}/{}", TOKENS_DIR, token);
-    if !Path::new(&token_file_path).exists() {
-        return false;
-    }
-    
-    match fs::read(&token_file_path) {
-        Ok(token_file) => {
-            let tkn = match decrypt::<Token>(&token_file) {
-                Some(t) => t,
-                None => return false,
-            };
-            
-            if tkn.exp < std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() {
-                return false;
-            }
-            if let Err(err) = fs::remove_file(&token_file_path) {
-                eprintln!("Failed to remove token file: {}", err);
-            }
-            return true;
-        }
-        Err(err) => eprintln!("Failed to read token file: {}", err),
-    }
-    false
- }
-
-
-fn generate_admin_password() -> String {
-    let password = generate_random_password();
-    set_admin_password(&password).unwrap();
-    password
+    let plain = blocking(move || crypto::decrypt(&data))
+        .await?
+        .ok_or_else(|| ApiError::internal(format!("could not decrypt {}", path.display())))?;
+    let mime = mime_guess::from_path(&name).first_or_octet_stream();
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_TYPE, mime.essence_str().parse().map_err(ApiError::internal)?);
+    // uploads are untrusted: never let them run as pages on this origin
+    headers.insert(header::CONTENT_DISPOSITION, header::HeaderValue::from_static("attachment"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("sandbox"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    res.body(Bytes::from(plain));
+    Ok(())
 }
 
-fn generate_random_password() -> String {
-    random_string(32)
-}
-
-fn get_admin_password() -> Option<String> {
-    match fs::read_to_string(ADMIN_PWD_FILE_PATH) {
-        Ok(password) => Some(password.trim().to_string()),
-        Err(_) => None,
+#[handler]
+async fn delete_file(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Delete, Some(&name)).await?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(Json(json!({ "deleted": name }))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(not_found_file()),
+        Err(e) => Err(ApiError::internal(e)),
     }
 }
 
-fn set_admin_password(password: &str) -> io::Result<()> {
-    fs::write(ADMIN_PWD_FILE_PATH, password)
+// ---- static ----
+
+#[handler]
+async fn index(req: &mut Request, res: &mut Response) {
+    statics::serve_static(req, res, "index.html").await
 }
 
-fn random_string(len: usize) -> String {
-    thread_rng()
-        .sample_iter(&Alphanumeric)
-        .map(char::from)
-        .take(len).collect()
+#[handler]
+async fn static_file(req: &mut Request, res: &mut Response) {
+    let name = req.param::<String>("filename").unwrap_or_default();
+    statics::serve_static(req, res, &name).await
 }
 
-#[allow(dead_code)]
-fn random_bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|_| rand::random::<u8>()).collect()
+/// Serves the 404 page for routes that don't exist.
+#[handler]
+async fn catch_not_found(req: &mut Request, res: &mut Response, ctrl: &mut FlowCtrl) {
+    if res.status_code == Some(StatusCode::NOT_FOUND) {
+        statics::not_found(req, res).await;
+        ctrl.skip_rest();
+    }
 }
 
-#[actix_web::main]
+// ---- startup ----
+
+fn router() -> Router {
+    Router::new()
+        .get(index)
+        .push(Router::with_path("make-tokens/{count}").post(make_tokens_simple))
+        .push(Router::with_path("mktn").post(make_tokens_custom))
+        .push(Router::with_path("expire-tokens").post(expire_tokens))
+        .push(Router::with_path("revoke-tokens").post(revoke_tokens))
+        .push(Router::with_path("remove-gz-files").post(remove_gz_files))
+        .push(Router::with_path("admin/change-password").post(change_password))
+        .push(Router::with_path("token").get(token_info))
+        .push(Router::with_path("files").get(list_files))
+        .push(Router::with_path("file-info/{filename}").get(file_info))
+        .push(
+            Router::with_path("file/{filename}")
+                .get(download_file)
+                .post(upload_file)
+                .delete(delete_file),
+        )
+        .push(Router::with_path("static/{filename}").get(static_file))
+}
+
+fn service() -> Service {
+    Service::new(router()).catcher(Catcher::default().hoop(catch_not_found))
+}
+
+#[tokio::main]
 async fn main() -> io::Result<()> {
-    fs::create_dir_all(TOKENS_DIR)?;
-    let _ampwd = get_admin_password().unwrap_or_else(|| {
-        let password = random_string(32);
-        set_admin_password(&password).unwrap();
-        password
+    for dir in [config::SECRETS_DIR, config::TOKENS_DIR, config::DIST_DIR] {
+        fs::create_dir_all(dir)?;
+    }
+    crypto::init_master_key()?;
+    crypto::init_admin_password()?;
+
+    let cfg = config::get();
+    let addr = format!("{}:{}", cfg.addr, cfg.port);
+
+    // sweep expired tokens every hour
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            tick.tick().await;
+            let _ = tokio::task::spawn_blocking(tokens::remove_expired).await;
+        }
     });
 
-    // let tls_config = load_rustls_config();
-
-    HttpServer::new(|| {
-        App::new()
-            .service(generate_token)
-            .service(make_token_request)
-            .service(change_password)
-            .service(expire_tokens)
-            .service(remove_gz_files)
-            .service(get_file_info)
-            .service(upload_file)
-            .service(delete_file)
-            .service(download_file)
-            .service(serve_index)
-            .service(srv_stc_files)
-    })
-    //bind_rustls(("0.0.0.0", 9797), tls_config)?
-    .bind(("0.0.0.0", 9797))?
-    .run().await
+    let (cert, key) = (PathBuf::from(&cfg.cert), PathBuf::from(&cfg.key));
+    if cert.exists() || key.exists() {
+        let tls = RustlsConfig::new(Keycert::new().cert_from_path(&cert)?.key_from_path(&key)?);
+        let acceptor = TcpListener::new(addr.clone()).rustls(tls).try_bind().await.map_err(io::Error::other)?;
+        println!("paka listening on https://{addr}");
+        Server::new(acceptor).try_serve(service()).await
+    } else {
+        println!("no TLS cert/key at {} / {}, serving plain http", cfg.cert, cfg.key);
+        let acceptor = TcpListener::new(addr.clone()).try_bind().await.map_err(io::Error::other)?;
+        println!("paka listening on http://{addr}");
+        Server::new(acceptor).try_serve(service()).await
+    }
 }
 
-fn load_rustls_config() -> rustls::ServerConfig {
-    // init server config builder with safe defaults
-    let config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth();
+#[cfg(test)]
+mod tests {
+    use salvo::test::{ResponseExt, TestClient};
 
-    // load TLS key/cert files
-    let cert_file = &mut BufReader::new(fs::File::open(CERT_PEM).expect(format!("Could not open cert file at {}.", CERT_PEM).as_str()));
-    let key_file = &mut BufReader::new(fs::File::open(PRIV_PEM).expect(format!("Could not open priv/key file at {}.", PRIV_PEM).as_str()));
+    use super::*;
 
-    // convert files to key/cert objects
-    let cert_chain = certs(cert_file)
-        .unwrap()
-        .into_iter()
-        .map(Certificate)
-        .collect();
-    let mut keys: Vec<PrivateKey> = pkcs8_private_keys(key_file)
-        .unwrap()
-        .into_iter()
-        .map(PrivateKey)
-        .collect();
+    #[tokio::test]
+    async fn routes_without_auth() {
+        let svc = service();
+        let url = |p: &str| format!("http://127.0.0.1{p}");
 
-    // exit if no keys could be parsed
-    if keys.is_empty() {
-        eprintln!("Could not locate PKCS 8 private keys.");
-        std::process::exit(1);
+        let res = TestClient::get(url("/file/x.txt")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::UNAUTHORIZED));
+
+        let mut res = TestClient::get(url("/file/..%2Fadmin_pwd.txt?tk=a")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+        assert!(res.take_string().await.unwrap().contains("invalid file name"));
+
+        let res = TestClient::get(url("/no/such/route")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
     }
-
-    config.with_single_cert(cert_chain, keys.remove(0)).unwrap()
 }

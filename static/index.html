@@ -1,40 +1,229 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Paka - token based file service</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Paka - token based file service</title>
+  <style>
+    :root { --bg: #f6f6f4; --card: #fff; --fg: #1d1d1b; --muted: #6b6b66; --line: #ddddd8; --accent: #2f6f5e; --err: #b3261e; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #161615; --card: #20201e; --fg: #ececea; --muted: #9a9a94; --line: #34342f; --accent: #6fbfa6; --err: #ff8a80; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+    main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+    h1 { margin: 0 0 4px; } h2 { font-size: 1.1rem; margin: 0 0 12px; }
+    .sub { color: var(--muted); margin: 0 0 24px; }
+    section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+    label { color: var(--muted); font-size: .9rem; display: inline-flex; gap: 4px; align-items: center; }
+    input, textarea, button { font: inherit; color: inherit; }
+    input[type=text], input[type=password], input[type=number], textarea {
+      background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0;
+    }
+    input[type=number] { width: 6em; }
+    textarea { width: 100%; min-height: 90px; font-family: ui-monospace, monospace; font-size: .85rem; }
+    button { background: var(--accent); color: var(--card); border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+    button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+    button:disabled { opacity: .5; cursor: default; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td:last-child { text-align: right; white-space: nowrap; }
+    #log { font-family: ui-monospace, monospace; font-size: .85rem; white-space: pre-wrap; color: var(--muted); max-height: 200px; overflow: auto; }
+    .err { color: var(--err); }
+  </style>
 </head>
 <body>
-    <h1>Paka</h1>
-    <input type="password">
-    <script type="module">
-        import paka from "./static/paka.mjs"
-        console.log(paka, Object.getOwnPropertyDescriptors(paka));
-        (async () => {
-            const p = await new Promise(async (resolve, reject) => {
-                document.querySelector('input[type="password"]').addEventListener('keydown', async e => {
-                    if (e.key === 'Enter') {
-                        e.preventDefault()
-                        localStorage.setItem('tokens', JSON.stringify(await paka.makeTokens(e.target.value, 3)))
-                        await fetch('/remove-gz-files', {method: 'POST', body: e.target.value})
-                        const p = paka.fromTokens(...JSON.parse(localStorage.getItem('tokens')))()
-                        p.ifTaking(_ => {
-                            localStorage.setItem('tokens', JSON.stringify(p.tokens))
-                        })
-                        resolve(p)
-                    }
-                })
-            })
+<main>
+  <h1>Paka</h1>
+  <p class="sub">Encrypted file storage where every request spends a token.</p>
 
-            console.log(p)
+  <section>
+    <h2>Admin</h2>
+    <div class="row">
+      <input id="pwd" type="password" placeholder="admin password" autocomplete="current-password">
+    </div>
+    <div class="row">
+      <label>count <input id="count" type="number" min="1" max="1000" value="5"></label>
+      <label>uses each <input id="uses" type="number" min="1" value="1"></label>
+      <label>valid for (hours) <input id="ttl" type="number" min="0.01" step="any" value="24"></label>
+      <label>only file <input id="only-file" type="text" placeholder="any"></label>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" name="op" value="read" checked> read</label>
+      <label><input type="checkbox" name="op" value="write" checked> write</label>
+      <label><input type="checkbox" name="op" value="delete" checked> delete</label>
+      <label><input type="checkbox" name="op" value="list" checked> list</label>
+    </div>
+    <div class="row">
+      <button id="make">Generate tokens</button>
+      <button class="ghost" id="expire">Remove expired tokens</button>
+      <button class="ghost" id="revoke">Revoke all tokens</button>
+      <button class="ghost" id="change">Change password…</button>
+    </div>
+  </section>
 
-            console.log('trying to write file: test - ', await p.post('test', 'test data 123 456 789 0 music is cool'))
-            console.log('trying to read file: test - ', await p.get('test'))
-            console.log('trying to delete file: test - ', await p.delete('test'))
-            
-            console.log('success, 3 tokens spent');
-        })()
-    </script>
+  <section>
+    <h2>Tokens <span id="left" class="sub"></span></h2>
+    <textarea id="tokens" placeholder="one token per line, each request uses the first one"></textarea>
+  </section>
+
+  <section>
+    <h2>Files</h2>
+    <div class="row">
+      <input id="upload" type="file" multiple>
+      <button id="send">Upload</button>
+      <button class="ghost" id="refresh">List files</button>
+    </div>
+    <table><tbody id="files"></tbody></table>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script type="module">
+import paka from './static/paka.mjs'
+
+const $ = s => document.querySelector(s)
+const store = {
+  get: () => { try { return localStorage.getItem('paka-tokens') || '' } catch { return '' } },
+  set: v => { try { localStorage.setItem('paka-tokens', v) } catch {} },
+}
+
+const log = (msg, isErr = false) => {
+  const line = document.createElement('div')
+  line.textContent = `${new Date().toLocaleTimeString()}  ${msg}`
+  if (isErr) line.className = 'err'
+  $('#log').prepend(line)
+}
+
+// the textarea is the token pool; the client takes from it and writes back
+const pool = () => $('#tokens').value.split(/\s+/).filter(Boolean)
+const showPool = tokens => {
+  $('#tokens').value = tokens.join('\n')
+  $('#left').textContent = `(${tokens.length} left)`
+  store.set($('#tokens').value)
+}
+const client = () => {
+  const c = paka('/file/', pool())
+  c.ifTaking(() => showPool(c.tokens))
+  return c
+}
+$('#tokens').value = store.get()
+showPool(pool())
+$('#tokens').addEventListener('input', () => showPool(pool()))
+
+const run = (btn, fn) => btn.addEventListener('click', async () => {
+  btn.disabled = true
+  try { await fn() } catch (e) { log(e.message, true) } finally { btn.disabled = false }
+})
+
+/** Throws the server's error message for a failed response. */
+const ok = async res => {
+  if (res.ok) return res
+  const body = await res.json().catch(() => ({}))
+  throw new Error(body.error || `status ${res.status}`)
+}
+
+const pwd = () => {
+  const p = $('#pwd').value.trim()
+  if (!p) throw new Error('enter the admin password first')
+  return p
+}
+
+run($('#make'), async () => {
+  const ops = [...document.querySelectorAll('input[name=op]:checked')].map(i => i.value)
+  if (!ops.length) throw new Error('pick at least one operation')
+  const opts = {
+    pwd: pwd(),
+    count: +$('#count').value || 1,
+    uses: +$('#uses').value || 1,
+    ttl: Math.round((+$('#ttl').value || 24) * 3600),
+  }
+  if (ops.length < 4) opts.ops = ops
+  if ($('#only-file').value.trim()) opts.file = $('#only-file').value.trim()
+  const tokens = await paka.makeTokenRequest(opts)
+  showPool([...pool(), ...tokens])
+  log(`generated ${tokens.length} token(s)`)
+})
+
+run($('#expire'), async () => log(`removed ${(await paka.expireTokens(pwd())).removed} expired token(s)`))
+
+run($('#revoke'), async () => {
+  const p = pwd()
+  if (!confirm('Revoke every token, including ones handed out?')) return
+  log(`revoked ${(await paka.revokeTokens(p)).removed} token(s)`)
+  showPool([])
+})
+
+run($('#change'), async () => {
+  const p = pwd()
+  const next = prompt('New admin password (at least 8 characters)')
+  if (!next) return
+  await paka.changePassword(p, next)
+  $('#pwd').value = next
+  log('admin password changed')
+})
+
+const fmtSize = n => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`
+
+const renderFiles = files => {
+  const body = $('#files')
+  body.replaceChildren()
+  if (!files.length) {
+    body.innerHTML = '<tr><td class="sub">no files</td></tr>'
+    return
+  }
+  for (const f of files) {
+    const tr = document.createElement('tr')
+    const name = document.createElement('td')
+    name.textContent = f.filename
+    const size = document.createElement('td')
+    size.className = 'num'
+    size.textContent = fmtSize(f.size)
+    const actions = document.createElement('td')
+    const dl = Object.assign(document.createElement('button'), { className: 'ghost', textContent: 'Download' })
+    const del = Object.assign(document.createElement('button'), { className: 'ghost', textContent: 'Delete' })
+    run(dl, () => download(f.filename))
+    run(del, async () => {
+      if (!confirm(`Delete ${f.filename}?`)) return
+      await ok(await client().delete(f.filename))
+      log(`deleted ${f.filename}`)
+      tr.remove()
+    })
+    actions.append(dl, ' ', del)
+    tr.append(name, size, actions)
+    body.append(tr)
+  }
+}
+
+const download = async name => {
+  const blob = await (await ok(await client().get(name))).blob()
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: name })
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000)
+  log(`downloaded ${name}`)
+}
+
+run($('#refresh'), async () => {
+  const files = await (await ok(await client().list())).json()
+  renderFiles(files)
+  log(`listed ${files.length} file(s)`)
+})
+
+run($('#send'), async () => {
+  const files = [...$('#upload').files]
+  if (!files.length) throw new Error('choose a file to upload')
+  for (const f of files) {
+    await ok(await client().post(f.name, f))
+    log(`uploaded ${f.name} (${fmtSize(f.size)})`)
+  }
+  $('#upload').value = ''
+})
+</script>
 </body>
 </html>
