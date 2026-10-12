@@ -9,13 +9,13 @@ use std::{
     time::SystemTime,
 };
 
-use actix_files::NamedFile;
-use actix_web::{
-    http::{header, StatusCode},
-    web::Bytes,
-    HttpRequest, HttpResponse,
-};
 use flate2::{write::GzEncoder, Compression};
+use salvo::{
+    fs::NamedFile,
+    http::{header, Mime, StatusCode},
+    hyper::body::Bytes,
+    prelude::*,
+};
 
 use crate::config;
 
@@ -36,7 +36,7 @@ pub fn clear_cache() -> usize {
     GZ_CACHE.lock().unwrap().take().map_or(0, |c| c.len())
 }
 
-fn accepts_gzip(req: &HttpRequest) -> bool {
+fn accepts_gzip(req: &Request) -> bool {
     req.headers()
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -57,47 +57,60 @@ async fn gzipped(path: &Path, modified: SystemTime) -> Option<Bytes> {
     Some(bytes)
 }
 
-async fn serve(req: &HttpRequest, name: &str, status: StatusCode) -> Option<HttpResponse> {
+fn content_type(mime: &Mime) -> String {
+    if mime.type_() == "text" || mime.essence_str() == "application/javascript" {
+        format!("{}; charset=utf-8", mime.essence_str())
+    } else {
+        mime.essence_str().to_string()
+    }
+}
+
+/// Writes static file `name` into `res` with `status`, returns false if there is no such file.
+async fn serve(req: &Request, res: &mut Response, name: &str, status: StatusCode) -> bool {
     if !config::valid_filename(name) {
-        return None;
+        return false;
     }
     let path = Path::new(config::STATIC_DIR).join(name);
-    let meta = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file())?;
+    let Some(meta) = tokio::fs::metadata(&path).await.ok().filter(|m| m.is_file()) else {
+        return false;
+    };
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
 
     if accepts_gzip(req) && GZIPABLE_TYPES.contains(&mime.essence_str()) {
-        if let Some(body) = gzipped(&path, meta.modified().ok()?).await {
-            let content_type = if mime.type_() == mime_guess::mime::TEXT || mime.essence_str() == "application/javascript" {
-                format!("{}; charset=utf-8", mime.essence_str())
-            } else {
-                mime.essence_str().to_string()
-            };
-            return Some(
-                HttpResponse::build(status)
-                    .insert_header((header::CONTENT_TYPE, content_type))
-                    .insert_header((header::CONTENT_ENCODING, "gzip"))
-                    .insert_header((header::VARY, "Accept-Encoding"))
-                    .insert_header((header::CACHE_CONTROL, "no-cache"))
-                    .body(body),
-            );
+        if let Some(body) = gzipped(&path, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)).await {
+            let _ = res.add_header(header::CONTENT_TYPE, content_type(&mime), true);
+            let _ = res.add_header(header::CONTENT_ENCODING, "gzip", true);
+            let _ = res.add_header(header::VARY, "Accept-Encoding", true);
+            let _ = res.add_header(header::CACHE_CONTROL, "no-cache", true);
+            res.status_code(status);
+            res.body(body);
+            return true;
         }
     }
 
-    let mut res = NamedFile::open_async(&path).await.ok()?.into_response(req);
-    *res.status_mut() = status;
-    Some(res)
+    if status == StatusCode::OK {
+        match NamedFile::builder(&path).build().await {
+            Ok(file) => file.send(req.headers(), res).await,
+            Err(_) => return false,
+        }
+    } else {
+        let Ok(content) = tokio::fs::read(&path).await else { return false };
+        let _ = res.add_header(header::CONTENT_TYPE, content_type(&mime), true);
+        res.status_code(status);
+        res.body(content);
+    }
+    true
 }
 
-pub async fn serve_static(req: &HttpRequest, name: &str) -> HttpResponse {
-    match serve(req, name, StatusCode::OK).await {
-        Some(res) => res,
-        None => not_found(req).await,
+pub async fn serve_static(req: &Request, res: &mut Response, name: &str) {
+    if !serve(req, res, name, StatusCode::OK).await {
+        not_found(req, res).await;
     }
 }
 
-pub async fn not_found(req: &HttpRequest) -> HttpResponse {
-    match serve(req, "404.html", StatusCode::NOT_FOUND).await {
-        Some(res) => res,
-        None => HttpResponse::NotFound().body("404 Not Found"),
+pub async fn not_found(req: &Request, res: &mut Response) {
+    if !serve(req, res, "404.html", StatusCode::NOT_FOUND).await {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Text::Plain("404 Not Found"));
     }
 }

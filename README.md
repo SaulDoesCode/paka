@@ -41,7 +41,7 @@ Upgrading from the old version, where `admin_pwd.txt` held the plaintext passwor
 
 Tokens are single use and live for a day by default. With `/mktn` you can also give them several uses, a custom lifetime, restrict them to one file or to some operations, and attach a JSON payload the token holder can read back.
 
-Pass a token as `?tk=TOKEN` or in an `x-paka-token` header. A token is spent when a request is authorised, even if the file then turns out not to exist. A request outside a token's scope is refused with 403 and doesn't spend it.
+Pass a token as `?tk=TOKEN` or in an `x-paka-token` header. A token is spent when a request is authorised, even if the file then turns out not to exist. A request outside a token's scope (403), or an upload whose `Content-Length` is over the limit (413), is refused without spending it.
 
 ## API
 

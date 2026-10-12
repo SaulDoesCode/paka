@@ -7,42 +7,91 @@ mod crypto;
 mod statics;
 mod tokens;
 
-use std::{collections::HashMap, fs, io, path::PathBuf, time::Duration};
+use std::{fs, io, path::PathBuf, time::Duration};
 
-use actix_web::{
-    delete, get,
-    http::{header, StatusCode},
-    post, web, App, HttpRequest, HttpResponse, HttpServer,
+use salvo::{
+    catcher::Catcher,
+    conn::rustls::{Keycert, RustlsConfig},
+    http::{header, ParseError, StatusCode},
+    hyper::body::Bytes,
+    prelude::*,
 };
-use serde::Deserialize;
-use serde_json::json;
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::{json, Value};
 
-use config::{Config, MAX_TOKENS_PER_REQUEST};
+use config::MAX_TOKENS_PER_REQUEST;
 use tokens::{AuthError, Op, Token};
 
-fn error(status: StatusCode, msg: &str) -> HttpResponse {
-    HttpResponse::build(status).json(json!({ "error": msg }))
+/// Admin passwords and JSON bodies are small; only uploads get the big limit.
+const SMALL_BODY: usize = 1024 * 1024;
+
+/// An error response: `{"error": "..."}` with a status code.
+struct ApiError(StatusCode, String);
+
+impl ApiError {
+    fn new(status: StatusCode, msg: impl Into<String>) -> Self {
+        ApiError(status, msg.into())
+    }
+
+    fn internal(e: impl std::fmt::Display) -> Self {
+        eprintln!("internal error: {e}");
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+    }
 }
 
-fn internal(e: impl std::fmt::Display) -> HttpResponse {
-    eprintln!("internal error: {e}");
-    error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+impl From<ParseError> for ApiError {
+    fn from(e: ParseError) -> Self {
+        match e {
+            ParseError::PayloadTooLarge => ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+            e => ApiError::new(StatusCode::BAD_REQUEST, e.to_string()),
+        }
+    }
 }
+
+impl From<AuthError> for ApiError {
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::Invalid => ApiError::new(StatusCode::UNAUTHORIZED, "invalid or used up token"),
+            AuthError::Expired => ApiError::new(StatusCode::UNAUTHORIZED, "token expired"),
+            AuthError::OutOfScope => ApiError::new(StatusCode::FORBIDDEN, "token not valid for this request"),
+        }
+    }
+}
+
+impl Scribe for ApiError {
+    fn render(self, res: &mut Response) {
+        res.status_code(self.0);
+        res.render(Json(json!({ "error": self.1 })));
+    }
+}
+
+type ApiResult = Result<Json<Value>, ApiError>;
 
 /// Runs blocking work (file IO, crypto, argon2) off the async workers.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, HttpResponse> {
-    web::block(f).await.map_err(internal)
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f).await.map_err(ApiError::internal)
+}
+
+/// Parses a JSON body regardless of its Content-Type.
+async fn json_body<T: DeserializeOwned>(req: &mut Request) -> Result<T, ApiError> {
+    let body = req.payload_with_max_size(SMALL_BODY).await?;
+    serde_json::from_slice(body).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))
 }
 
 // ---- admin ----
 
-async fn is_admin(pwd: Vec<u8>) -> bool {
-    blocking(move || crypto::verify_admin_password(&pwd)).await.unwrap_or(false)
+async fn check_admin(pwd: Vec<u8>) -> Result<(), ApiError> {
+    if blocking(move || crypto::verify_admin_password(&pwd)).await? {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong admin password"))
+    }
 }
 
 /// Older routes take the admin password as the raw request body.
-fn body_password(body: &web::Bytes) -> Vec<u8> {
-    String::from_utf8_lossy(body).trim().as_bytes().to_vec()
+async fn check_body_admin(req: &mut Request) -> Result<(), ApiError> {
+    let body = req.payload_with_max_size(SMALL_BODY).await?;
+    check_admin(String::from_utf8_lossy(body).trim().as_bytes().to_vec()).await
 }
 
 #[derive(Deserialize)]
@@ -60,81 +109,65 @@ struct MakeTokenRequest {
     /// restrict the token to some of: read, write, delete, list
     ops: Option<Vec<Op>>,
     /// any JSON, handed back by GET /token
-    payload: Option<serde_json::Value>,
+    payload: Option<Value>,
 }
 
-async fn make_tokens(count: usize, spec: Token) -> HttpResponse {
+async fn make_tokens(count: usize, spec: Token) -> ApiResult {
     if count == 0 || count > MAX_TOKENS_PER_REQUEST {
-        return error(StatusCode::BAD_REQUEST, &format!("count must be between 1 and {MAX_TOKENS_PER_REQUEST}"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("count must be between 1 and {MAX_TOKENS_PER_REQUEST}"),
+        ));
     }
-    match blocking(move || tokens::create(&spec, count)).await {
-        Ok(Ok(tokens)) => HttpResponse::Ok().json(tokens),
-        Ok(Err(e)) => internal(e),
-        Err(res) => res,
-    }
+    let tokens = blocking(move || tokens::create(&spec, count)).await?.map_err(ApiError::internal)?;
+    Ok(Json(json!(tokens)))
 }
 
-#[post("/make-tokens/{count}")]
-async fn make_tokens_simple(cfg: web::Data<Config>, count: web::Path<usize>, body: web::Bytes) -> HttpResponse {
-    if !is_admin(body_password(&body)).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
-    let spec = Token { exp: config::now() + cfg.token_ttl_secs, uses: 1, file: None, ops: None, payload: None };
-    make_tokens(count.into_inner(), spec).await
+#[handler]
+async fn make_tokens_simple(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    let count = req.param::<usize>("count").ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "count must be a number"))?;
+    let spec = Token { exp: config::now() + config::get().token_ttl_secs, uses: 1, file: None, ops: None, payload: None };
+    make_tokens(count, spec).await
 }
 
-#[post("/mktn")]
-async fn make_tokens_custom(cfg: web::Data<Config>, req: web::Json<MakeTokenRequest>) -> HttpResponse {
-    let req = req.into_inner();
-    if !is_admin(req.pwd.into_bytes()).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
-    let exp = req.exp.unwrap_or_else(|| config::now().saturating_add(req.ttl.unwrap_or(cfg.token_ttl_secs)));
+#[handler]
+async fn make_tokens_custom(req: &mut Request) -> ApiResult {
+    let req: MakeTokenRequest = json_body(req).await?;
+    check_admin(req.pwd.into_bytes()).await?;
+    let bad = |msg: &str| Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
+    let exp = req.exp.unwrap_or_else(|| config::now().saturating_add(req.ttl.unwrap_or(config::get().token_ttl_secs)));
     if exp <= config::now() {
-        return error(StatusCode::BAD_REQUEST, "exp must be in the future");
+        return bad("exp must be in the future");
     }
     let uses = req.uses.unwrap_or(1);
     if uses == 0 {
-        return error(StatusCode::BAD_REQUEST, "uses must be at least 1");
+        return bad("uses must be at least 1");
     }
-    if let Some(file) = &req.file {
-        if !config::valid_filename(file) {
-            return error(StatusCode::BAD_REQUEST, "invalid file name");
-        }
+    if req.file.as_deref().is_some_and(|f| !config::valid_filename(f)) {
+        return bad("invalid file name");
     }
     let payload = req.payload.map(|p| p.to_string());
     let spec = Token { exp, uses, file: req.file, ops: req.ops, payload };
     make_tokens(req.count.unwrap_or(1), spec).await
 }
 
-#[post("/expire-tokens")]
-async fn expire_tokens(body: web::Bytes) -> HttpResponse {
-    if !is_admin(body_password(&body)).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
-    match blocking(tokens::remove_expired).await {
-        Ok(removed) => HttpResponse::Ok().json(json!({ "removed": removed })),
-        Err(res) => res,
-    }
+#[handler]
+async fn expire_tokens(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "removed": blocking(tokens::remove_expired).await? })))
 }
 
-#[post("/revoke-tokens")]
-async fn revoke_tokens(body: web::Bytes) -> HttpResponse {
-    if !is_admin(body_password(&body)).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
-    match blocking(tokens::revoke_all).await {
-        Ok(removed) => HttpResponse::Ok().json(json!({ "removed": removed })),
-        Err(res) => res,
-    }
+#[handler]
+async fn revoke_tokens(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "removed": blocking(tokens::revoke_all).await? })))
 }
 
-#[post("/remove-gz-files")]
-async fn remove_gz_files(body: web::Bytes) -> HttpResponse {
-    if !is_admin(body_password(&body)).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
-    HttpResponse::Ok().json(json!({ "cleared": statics::clear_cache() }))
+#[handler]
+async fn remove_gz_files(req: &mut Request) -> ApiResult {
+    check_body_admin(req).await?;
+    Ok(Json(json!({ "cleared": statics::clear_cache() })))
 }
 
 #[derive(Deserialize)]
@@ -143,88 +176,72 @@ struct ChangePassword {
     new_pwd: String,
 }
 
-#[post("/admin/change-password")]
-async fn change_password(req: web::Json<ChangePassword>) -> HttpResponse {
-    let ChangePassword { pwd, new_pwd } = req.into_inner();
-    if !is_admin(pwd.into_bytes()).await {
-        return error(StatusCode::UNAUTHORIZED, "wrong admin password");
-    }
+#[handler]
+async fn change_password(req: &mut Request) -> ApiResult {
+    let ChangePassword { pwd, new_pwd } = json_body(req).await?;
+    check_admin(pwd.into_bytes()).await?;
     let new_pwd = new_pwd.trim().to_string();
     if new_pwd.len() < 8 {
-        return error(StatusCode::BAD_REQUEST, "new password must be at least 8 characters");
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "new password must be at least 8 characters"));
     }
-    match blocking(move || crypto::set_admin_password(&new_pwd)).await {
-        Ok(Ok(())) => HttpResponse::Ok().json(json!({ "ok": true })),
-        Ok(Err(e)) => internal(e),
-        Err(res) => res,
-    }
+    blocking(move || crypto::set_admin_password(&new_pwd)).await?.map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---- token holders ----
 
 /// The token comes from `?tk=` or the `x-paka-token` header.
-fn token_of(req: &HttpRequest) -> Option<String> {
-    web::Query::<HashMap<String, String>>::from_query(req.query_string())
-        .ok()
-        .and_then(|q| q.get("tk").cloned())
-        .or_else(|| req.headers().get("x-paka-token").and_then(|v| v.to_str().ok()).map(str::to_string))
+fn token_of(req: &Request) -> Result<String, ApiError> {
+    req.query::<String>("tk")
+        .or_else(|| req.header::<String>("x-paka-token"))
         .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "missing token, pass ?tk=TOKEN"))
 }
 
-fn auth_error(e: AuthError) -> HttpResponse {
-    match e {
-        AuthError::Invalid => error(StatusCode::UNAUTHORIZED, "invalid or used up token"),
-        AuthError::Expired => error(StatusCode::UNAUTHORIZED, "token expired"),
-        AuthError::OutOfScope => error(StatusCode::FORBIDDEN, "token not valid for this request"),
-    }
-}
-
-/// Spends a token for `op` on `file`, or returns the error response.
-async fn authorize(req: &HttpRequest, op: Op, file: Option<&str>) -> Result<Token, HttpResponse> {
-    let Some(tk) = token_of(req) else {
-        return Err(error(StatusCode::UNAUTHORIZED, "missing token, pass ?tk=TOKEN"));
-    };
+/// Spends a token for `op` on `file`.
+async fn authorize(req: &Request, op: Op, file: Option<&str>) -> Result<Token, ApiError> {
+    let tk = token_of(req)?;
     let file = file.map(str::to_string);
-    blocking(move || tokens::consume(&tk, op, file.as_deref())).await?.map_err(auth_error)
+    Ok(blocking(move || tokens::consume(&tk, op, file.as_deref())).await??)
 }
 
-fn file_path(name: &str) -> Result<PathBuf, HttpResponse> {
-    if config::valid_filename(name) {
-        Ok(PathBuf::from(config::DIST_DIR).join(name))
-    } else {
-        Err(error(StatusCode::BAD_REQUEST, "invalid file name"))
-    }
+/// The `{filename}` route param, validated, and its path in `dist/`.
+fn file_param(req: &Request) -> Result<(String, PathBuf), ApiError> {
+    req.param::<String>("filename")
+        .filter(|name| config::valid_filename(name))
+        .map(|name| {
+            let path = PathBuf::from(config::DIST_DIR).join(&name);
+            (name, path)
+        })
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid file name"))
 }
 
-fn file_json(name: &str, meta: &fs::Metadata) -> serde_json::Value {
+fn not_found_file() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "file not found")
+}
+
+fn file_json(name: &str, meta: &fs::Metadata) -> Value {
     let modified = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
     json!({ "filename": name, "size": crypto::plaintext_len(meta.len()), "modified": modified })
 }
 
-#[get("/token")]
-async fn token_info(req: HttpRequest) -> HttpResponse {
-    let Some(tk) = token_of(&req) else {
-        return error(StatusCode::UNAUTHORIZED, "missing token, pass ?tk=TOKEN");
-    };
-    match blocking(move || tokens::peek(&tk)).await {
-        Ok(Ok(t)) => HttpResponse::Ok().json(json!({
-            "exp": t.exp,
-            "uses": t.uses,
-            "file": t.file,
-            "ops": t.ops,
-            "payload": t.payload.and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok()),
-        })),
-        Ok(Err(e)) => auth_error(e),
-        Err(res) => res,
-    }
+#[handler]
+async fn token_info(req: &mut Request) -> ApiResult {
+    let tk = token_of(req)?;
+    let t = blocking(move || tokens::peek(&tk)).await??;
+    Ok(Json(json!({
+        "exp": t.exp,
+        "uses": t.uses,
+        "file": t.file,
+        "ops": t.ops,
+        "payload": t.payload.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+    })))
 }
 
-#[get("/files")]
-async fn list_files(req: HttpRequest) -> HttpResponse {
-    if let Err(res) = authorize(&req, Op::List, None).await {
-        return res;
-    }
-    let listed = blocking(|| -> io::Result<Vec<serde_json::Value>> {
+#[handler]
+async fn list_files(req: &mut Request) -> ApiResult {
+    authorize(req, Op::List, None).await?;
+    let files = blocking(|| -> io::Result<Vec<Value>> {
         let mut files: Vec<_> = fs::read_dir(config::DIST_DIR)?
             .flatten()
             .filter_map(|e| {
@@ -236,129 +253,122 @@ async fn list_files(req: HttpRequest) -> HttpResponse {
         files.sort_by(|a, b| a["filename"].as_str().cmp(&b["filename"].as_str()));
         Ok(files)
     })
-    .await;
-    match listed {
-        Ok(Ok(files)) => HttpResponse::Ok().json(files),
-        Ok(Err(e)) => internal(e),
-        Err(res) => res,
-    }
+    .await?
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!(files)))
 }
 
-#[get("/file-info/{filename}")]
-async fn file_info(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    let path = match file_path(&filename) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    if let Err(res) = authorize(&req, Op::Read, Some(&filename)).await {
-        return res;
-    }
+#[handler]
+async fn file_info(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Read, Some(&name)).await?;
     match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.is_file() => HttpResponse::Ok().json(file_json(&filename, &meta)),
-        _ => error(StatusCode::NOT_FOUND, "file not found"),
+        Ok(meta) if meta.is_file() => Ok(Json(file_json(&name, &meta))),
+        _ => Err(not_found_file()),
     }
 }
 
-#[post("/file/{filename}")]
-async fn upload_file(req: HttpRequest, filename: web::Path<String>, body: web::Bytes) -> HttpResponse {
-    let path = match file_path(&filename) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    if let Err(res) = authorize(&req, Op::Write, Some(&filename)).await {
-        return res;
+#[handler]
+async fn upload_file(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    let max = config::get().max_upload_bytes;
+    // reject declared oversize uploads before spending the token
+    if req.header::<usize>(header::CONTENT_LENGTH).is_some_and(|len| len > max) {
+        return Err(ParseError::PayloadTooLarge.into());
     }
+    authorize(req, Op::Write, Some(&name)).await?;
+    let body = req.payload_with_max_size(max).await?.clone();
     let size = body.len();
-    match blocking(move || crypto::encrypt(&body).and_then(|enc| crypto::write_atomic(&path, &enc))).await {
-        Ok(Ok(())) => HttpResponse::Ok().json(json!({ "filename": filename.as_str(), "size": size })),
-        Ok(Err(e)) => internal(e),
-        Err(res) => res,
-    }
+    blocking(move || crypto::encrypt(&body).and_then(|enc| crypto::write_atomic(&path, &enc)))
+        .await?
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "filename": name, "size": size })))
 }
 
-#[get("/file/{filename}")]
-async fn download_file(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    let path = match file_path(&filename) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    if let Err(res) = authorize(&req, Op::Read, Some(&filename)).await {
-        return res;
-    }
+#[handler]
+async fn download_file(req: &mut Request, res: &mut Response) -> Result<(), ApiError> {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Read, Some(&name)).await?;
     let data = match tokio::fs::read(&path).await {
         Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return error(StatusCode::NOT_FOUND, "file not found"),
-        Err(e) => return internal(e),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(not_found_file()),
+        Err(e) => return Err(ApiError::internal(e)),
     };
-    match blocking(move || crypto::decrypt(&data)).await {
-        Ok(Some(plain)) => HttpResponse::Ok()
-            .content_type(mime_guess::from_path(&path).first_or_octet_stream())
-            // uploads are untrusted: never let them run as pages on this origin
-            .insert_header((header::CONTENT_DISPOSITION, "attachment"))
-            .insert_header((header::CONTENT_SECURITY_POLICY, "sandbox"))
-            .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
-            .body(plain),
-        Ok(None) => internal(format!("could not decrypt {}", path.display())),
-        Err(res) => res,
-    }
+    let plain = blocking(move || crypto::decrypt(&data))
+        .await?
+        .ok_or_else(|| ApiError::internal(format!("could not decrypt {}", path.display())))?;
+    let mime = mime_guess::from_path(&name).first_or_octet_stream();
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_TYPE, mime.essence_str().parse().map_err(ApiError::internal)?);
+    // uploads are untrusted: never let them run as pages on this origin
+    headers.insert(header::CONTENT_DISPOSITION, header::HeaderValue::from_static("attachment"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("sandbox"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    res.body(Bytes::from(plain));
+    Ok(())
 }
 
-#[delete("/file/{filename}")]
-async fn delete_file(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    let path = match file_path(&filename) {
-        Ok(p) => p,
-        Err(res) => return res,
-    };
-    if let Err(res) = authorize(&req, Op::Delete, Some(&filename)).await {
-        return res;
-    }
+#[handler]
+async fn delete_file(req: &mut Request) -> ApiResult {
+    let (name, path) = file_param(req)?;
+    authorize(req, Op::Delete, Some(&name)).await?;
     match tokio::fs::remove_file(&path).await {
-        Ok(()) => HttpResponse::Ok().json(json!({ "deleted": filename.as_str() })),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => error(StatusCode::NOT_FOUND, "file not found"),
-        Err(e) => internal(e),
+        Ok(()) => Ok(Json(json!({ "deleted": name }))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(not_found_file()),
+        Err(e) => Err(ApiError::internal(e)),
     }
 }
 
 // ---- static ----
 
-#[get("/")]
-async fn index(req: HttpRequest) -> HttpResponse {
-    statics::serve_static(&req, "index.html").await
+#[handler]
+async fn index(req: &mut Request, res: &mut Response) {
+    statics::serve_static(req, res, "index.html").await
 }
 
-#[get("/static/{filename}")]
-async fn static_file(req: HttpRequest, filename: web::Path<String>) -> HttpResponse {
-    statics::serve_static(&req, &filename).await
+#[handler]
+async fn static_file(req: &mut Request, res: &mut Response) {
+    let name = req.param::<String>("filename").unwrap_or_default();
+    statics::serve_static(req, res, &name).await
 }
 
-async fn fallback(req: HttpRequest) -> HttpResponse {
-    statics::not_found(&req).await
+/// Serves the 404 page for routes that don't exist.
+#[handler]
+async fn catch_not_found(req: &mut Request, res: &mut Response, ctrl: &mut FlowCtrl) {
+    if res.status_code == Some(StatusCode::NOT_FOUND) {
+        statics::not_found(req, res).await;
+        ctrl.skip_rest();
+    }
 }
 
 // ---- startup ----
 
-fn load_tls_config(cfg: &Config) -> io::Result<Option<rustls::ServerConfig>> {
-    let (cert_path, key_path) = (PathBuf::from(&cfg.cert), PathBuf::from(&cfg.key));
-    if !cert_path.exists() && !key_path.exists() {
-        return Ok(None);
-    }
-    let bad = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
-    let certs = rustls_pemfile::certs(&mut io::BufReader::new(fs::File::open(&cert_path)?))
-        .collect::<Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err(bad(format!("no certificates in {}", cert_path.display())));
-    }
-    let key = rustls_pemfile::private_key(&mut io::BufReader::new(fs::File::open(&key_path)?))?
-        .ok_or_else(|| bad(format!("no private key in {}", key_path.display())))?;
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map(Some)
-        .map_err(|e| bad(format!("invalid certificate/key: {e}")))
+fn router() -> Router {
+    Router::new()
+        .get(index)
+        .push(Router::with_path("make-tokens/{count}").post(make_tokens_simple))
+        .push(Router::with_path("mktn").post(make_tokens_custom))
+        .push(Router::with_path("expire-tokens").post(expire_tokens))
+        .push(Router::with_path("revoke-tokens").post(revoke_tokens))
+        .push(Router::with_path("remove-gz-files").post(remove_gz_files))
+        .push(Router::with_path("admin/change-password").post(change_password))
+        .push(Router::with_path("token").get(token_info))
+        .push(Router::with_path("files").get(list_files))
+        .push(Router::with_path("file-info/{filename}").get(file_info))
+        .push(
+            Router::with_path("file/{filename}")
+                .get(download_file)
+                .post(upload_file)
+                .delete(delete_file),
+        )
+        .push(Router::with_path("static/{filename}").get(static_file))
 }
 
-#[actix_web::main]
+fn service() -> Service {
+    Service::new(router()).catcher(Catcher::default().hoop(catch_not_found))
+}
+
+#[tokio::main]
 async fn main() -> io::Result<()> {
     for dir in [config::SECRETS_DIR, config::TOKENS_DIR, config::DIST_DIR] {
         fs::create_dir_all(dir)?;
@@ -366,56 +376,51 @@ async fn main() -> io::Result<()> {
     crypto::init_master_key()?;
     crypto::init_admin_password()?;
 
-    let cfg = Config::from_env();
-    let tls = load_tls_config(&cfg)?;
-    let addr = (cfg.addr.clone(), cfg.port);
-    let max_upload = cfg.max_upload_bytes;
-    let (cfg_cert, cfg_key) = (cfg.cert.clone(), cfg.key.clone());
-    let cfg = web::Data::new(cfg);
+    let cfg = config::get();
+    let addr = format!("{}:{}", cfg.addr, cfg.port);
 
     // sweep expired tokens every hour
-    actix_web::rt::spawn(async {
-        let mut tick = actix_web::rt::time::interval(Duration::from_secs(60 * 60));
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
             tick.tick().await;
-            let _ = web::block(tokens::remove_expired).await;
+            let _ = tokio::task::spawn_blocking(tokens::remove_expired).await;
         }
     });
 
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(cfg.clone())
-            .app_data(web::PayloadConfig::new(max_upload))
-            .app_data(web::JsonConfig::default().limit(1024 * 1024).error_handler(|err, _| {
-                let res = error(StatusCode::BAD_REQUEST, &err.to_string());
-                actix_web::error::InternalError::from_response(err, res).into()
-            }))
-            .service(make_tokens_simple)
-            .service(make_tokens_custom)
-            .service(expire_tokens)
-            .service(revoke_tokens)
-            .service(remove_gz_files)
-            .service(change_password)
-            .service(token_info)
-            .service(list_files)
-            .service(file_info)
-            .service(upload_file)
-            .service(download_file)
-            .service(delete_file)
-            .service(index)
-            .service(static_file)
-            .default_service(web::to(fallback))
-    });
+    let (cert, key) = (PathBuf::from(&cfg.cert), PathBuf::from(&cfg.key));
+    if cert.exists() || key.exists() {
+        let tls = RustlsConfig::new(Keycert::new().cert_from_path(&cert)?.key_from_path(&key)?);
+        let acceptor = TcpListener::new(addr.clone()).rustls(tls).try_bind().await.map_err(io::Error::other)?;
+        println!("paka listening on https://{addr}");
+        Server::new(acceptor).try_serve(service()).await
+    } else {
+        println!("no TLS cert/key at {} / {}, serving plain http", cfg.cert, cfg.key);
+        let acceptor = TcpListener::new(addr.clone()).try_bind().await.map_err(io::Error::other)?;
+        println!("paka listening on http://{addr}");
+        Server::new(acceptor).try_serve(service()).await
+    }
+}
 
-    match tls {
-        Some(tls) => {
-            println!("paka listening on https://{}:{}", addr.0, addr.1);
-            server.bind_rustls_0_23(addr, tls)?.run().await
-        }
-        None => {
-            println!("no TLS cert/key at {} / {}, serving plain http", cfg_cert, cfg_key);
-            println!("paka listening on http://{}:{}", addr.0, addr.1);
-            server.bind(addr)?.run().await
-        }
+#[cfg(test)]
+mod tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn routes_without_auth() {
+        let svc = service();
+        let url = |p: &str| format!("http://127.0.0.1{p}");
+
+        let res = TestClient::get(url("/file/x.txt")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::UNAUTHORIZED));
+
+        let mut res = TestClient::get(url("/file/..%2Fadmin_pwd.txt?tk=a")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+        assert!(res.take_string().await.unwrap().contains("invalid file name"));
+
+        let res = TestClient::get(url("/no/such/route")).send(&svc).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
     }
 }

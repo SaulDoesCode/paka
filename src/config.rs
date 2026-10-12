@@ -1,6 +1,6 @@
 //! Paths and settings. Paths are relative to the working directory; the rest can be set by env vars.
 
-use std::{env, str::FromStr};
+use std::{env, str::FromStr, sync::OnceLock};
 
 pub const ADMIN_PWD_FILE: &str = "./admin_pwd.txt";
 pub const MASTER_KEY_FILE: &str = "./secrets/master.key";
@@ -31,8 +31,15 @@ fn var<T: FromStr>(name: &str, default: T) -> T {
     }
 }
 
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// The settings, read from the environment on first use.
+pub fn get() -> &'static Config {
+    CONFIG.get_or_init(Config::from_env)
+}
+
 impl Config {
-    pub fn from_env() -> Self {
+    fn from_env() -> Self {
         Config {
             addr: var("PAKA_ADDR", "0.0.0.0".to_string()),
             port: var("PAKA_PORT", 9797),
